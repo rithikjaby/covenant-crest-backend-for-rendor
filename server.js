@@ -44,6 +44,14 @@
 
 'use strict';
 
+// ─────────────────────────────────────────────
+// PLATFORM COMPATIBILITY
+// Works on: Render.com, Railway.app, Heroku, Fly.io, VPS, local
+// Railway:  set env vars in Railway dashboard → Variables tab
+//           Railway auto-sets PORT — don't override it
+//           Deploy: connect GitHub repo → Railway auto-deploys on push
+// ─────────────────────────────────────────────
+
 const express  = require('express');
 const cors     = require('cors');
 const fs       = require('fs');
@@ -149,15 +157,22 @@ async function hashPassword(pwd) {
 
 async function verifyPassword(pwd, stored) {
   return new Promise((resolve, reject) => {
-    // Legacy plain-text fallback (for first-run migration)
-    if (!stored.startsWith('pbkdf2$')) {
-      return resolve(pwd === stored);
+    try {
+      // Plain-text fallback — covers env var passwords and legacy accounts
+      if (!stored || !stored.startsWith('pbkdf2$')) {
+        return resolve(pwd === stored);
+      }
+      const parts = stored.split('$');
+      if (parts.length !== 3) return resolve(pwd === stored);
+      const salt = parts[1];
+      const hash = parts[2];
+      crypto.pbkdf2(pwd, salt, 100000, 64, 'sha512', (err, key) => {
+        if (err) return reject(err);
+        resolve(key.toString('hex') === hash);
+      });
+    } catch (e) {
+      reject(e);
     }
-    const [, salt, hash] = stored.split('$');
-    crypto.pbkdf2(pwd, salt, 100_000, 64, 'sha512', (err, key) => {
-      if (err) return reject(err);
-      resolve(key.toString('hex') === hash);
-    });
   });
 }
 
@@ -429,7 +444,8 @@ app.get('/', (req, res) => res.json({
   timestamp: new Date().toISOString(),
 }));
 
-app.get('/health', (req, res) => res.json({ status: 'healthy', uptime: process.uptime() }));
+app.get('/health',     (req, res) => res.json({ status: 'healthy', uptime: process.uptime() }));
+app.get('/api/health', (req, res) => res.json({ status: 'healthy', uptime: process.uptime() }));
 
 // ─────────────────────────────────────────────
 // ROUTES — AUTH
@@ -449,9 +465,15 @@ app.post('/api/auth/login', rateLimit(15 * 60 * 1000, 10), async (req, res) => {
   }
 
   try {
-    // ── Super Admin ──────────────────────────
+    // ── Super Admin ──────────────────────────────────────────────
     if (emailLc === CFG.SUPER_ADMIN_EMAIL.toLowerCase()) {
-      const match = await verifyPassword(password, CFG.SUPER_ADMIN_PWD);
+      let match = false;
+      try {
+        match = await verifyPassword(password, CFG.SUPER_ADMIN_PWD);
+      } catch (e) {
+        // fallback: direct comparison (handles plain-text env vars)
+        match = (password === CFG.SUPER_ADMIN_PWD);
+      }
       if (match) {
         return res.json({
           token: makeToken({ email: emailLc, role: 'superadmin' }),
@@ -459,14 +481,21 @@ app.post('/api/auth/login', rateLimit(15 * 60 * 1000, 10), async (req, res) => {
           email: emailLc,
         });
       }
+      // Add consistent delay to prevent timing attacks
+      await new Promise(r => setTimeout(r, 200 + Math.random() * 100));
       return res.status(401).json({ error: 'Invalid email or password.' });
     }
 
-    // ── Employee accounts ────────────────────
+    // ── Employee accounts ─────────────────────────────────────────
     const users = readJSON(FILES.users);
     const user  = users.find(u => (u.email || '').toLowerCase() === emailLc);
     if (user && user.role === 'employee') {
-      const match = await verifyPassword(password, user.password);
+      let match = false;
+      try {
+        match = await verifyPassword(password, user.password);
+      } catch (e) {
+        match = (password === user.password);
+      }
       if (match) {
         return res.json({
           token: makeToken({ email: user.email, role: 'employee', id: user.id }),
@@ -476,12 +505,22 @@ app.post('/api/auth/login', rateLimit(15 * 60 * 1000, 10), async (req, res) => {
       }
     }
 
-    // Consistent timing to prevent user enumeration
-    await new Promise(r => setTimeout(r, 150 + Math.random() * 100));
+    await new Promise(r => setTimeout(r, 200 + Math.random() * 100));
     return res.status(401).json({ error: 'Invalid email or password.' });
 
   } catch (err) {
-    console.error('Login error:', err);
+    console.error('Login error:', err.message);
+    // Last-resort: try plain text comparison before giving up
+    try {
+      if (email.trim().toLowerCase() === CFG.SUPER_ADMIN_EMAIL.toLowerCase() &&
+          password === CFG.SUPER_ADMIN_PWD) {
+        return res.json({
+          token: makeToken({ email: email.trim().toLowerCase(), role: 'superadmin' }),
+          role : 'superadmin',
+          email: email.trim().toLowerCase(),
+        });
+      }
+    } catch (e2) { /* ignore */ }
     return res.status(500).json({ error: 'Login failed. Please try again.' });
   }
 });
