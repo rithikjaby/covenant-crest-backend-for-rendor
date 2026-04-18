@@ -90,6 +90,7 @@ const CFG = {
   ZOHO_CLIENT_ID     : process.env.ZOHO_CLIENT_ID     || '',
   ZOHO_CLIENT_SECRET : process.env.ZOHO_CLIENT_SECRET || '',
   ZOHO_REDIRECT_URI  : process.env.ZOHO_REDIRECT_URI  || 'https://covenantcrest.co.uk/api/zoho/callback',
+  ZOHO_SSO_REDIRECT_URI: process.env.ZOHO_SSO_REDIRECT_URI || 'https://www.covenantcrest.co.uk/api/auth/zoho-callback',
   ZOHO_REFRESH_TOKEN : process.env.ZOHO_REFRESH_TOKEN || '',   // set after first authorisation
   ZOHO_FROM_EMAIL    : process.env.ZOHO_FROM_EMAIL    || 'jaby.k@covenantcrest.co.uk',
   ZOHO_FROM_NAME     : process.env.ZOHO_FROM_NAME     || 'Covenant Crest Group',
@@ -252,6 +253,32 @@ const emailTpl = {
             <p style="font-size:14px;line-height:1.7;color:#333;">If your matter is urgent, please call us directly on <a href="tel:07346809846" style="color:#C9A84C;font-weight:600;">07346 809846</a>.</p>
             <hr style="margin:20px 0;border:none;border-top:1px solid #eee;">
             <p style="font-size:12px;color:#888;">Covenant Crest Group Ltd · Company No. 16528951 · Telford, Shropshire</p>
+          </div>
+        </div>`,
+    };
+  },
+
+  /* Auto-reply to candidate confirming application received */
+  applicationAutoReply({ first_name, last_name, sector, job_title }) {
+    const sectorLabel = { care:'care & healthcare', security:'security', warehouse:'warehouse & logistics' }[sector] || sector || 'your chosen';
+    return {
+      to     : null,  // set dynamically
+      subject: `We received your application — Covenant Crest Group`,
+      html   : `
+        <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#f8f8f8;padding:24px;border-radius:8px;">
+          <div style="background:#0D1B2A;padding:20px 24px;border-radius:6px 6px 0 0;text-align:center;">
+            <h2 style="color:#C9A84C;margin:0;font-size:20px;">Application Received</h2>
+          </div>
+          <div style="background:#fff;padding:24px;border-radius:0 0 6px 6px;border:1px solid #e0e0e0;">
+            <p style="font-size:14px;line-height:1.7;color:#333;">Dear <strong>${first_name} ${last_name}</strong>,</p>
+            <p style="font-size:14px;line-height:1.7;color:#333;">Thank you for applying for a <strong>${sectorLabel}</strong> role${job_title ? ' (<em>' + job_title + '</em>)' : ''} with Covenant Crest Group Ltd.</p>
+            <p style="font-size:14px;line-height:1.7;color:#333;">We have received your application and our recruitment team will review it shortly. If your profile matches our current requirements, a consultant will be in touch within <strong>24–48 hours</strong>.</p>
+            <div style="background:#f0f7f0;border-left:3px solid #C9A84C;padding:14px 18px;margin:20px 0;border-radius:0 6px 6px 0;">
+              <p style="font-size:13px;color:#333;margin:0;">If your matter is urgent, please call us directly on <a href="tel:07346809846" style="color:#C9A84C;font-weight:600;">07346 809846</a> or email <a href="mailto:recruitment@covenantcrest.co.uk" style="color:#C9A84C;">recruitment@covenantcrest.co.uk</a>.</p>
+            </div>
+            <hr style="margin:20px 0;border:none;border-top:1px solid #eee;">
+            <p style="font-size:12px;color:#888;margin:0;">Covenant Crest Group Ltd &middot; Company No. 16528951 &middot; Telford, Shropshire</p>
+            <p style="font-size:11px;color:#bbb;margin:4px 0 0;">This is an automated confirmation. Please do not reply to this email.</p>
           </div>
         </div>`,
     };
@@ -444,8 +471,8 @@ app.get('/', (req, res) => res.json({
   timestamp: new Date().toISOString(),
 }));
 
-app.get('/health',     (req, res) => res.json({ status: 'healthy', uptime: process.uptime() }));
-app.get('/api/health', (req, res) => res.json({ status: 'healthy', uptime: process.uptime() }));
+app.get('/health',     (req, res) => res.json({ status: 'healthy', uptime: process.uptime(), zohoSSOConfigured: !!(CFG.ZOHO_CLIENT_ID && CFG.ZOHO_CLIENT_SECRET) }));
+app.get('/api/health', (req, res) => res.json({ status: 'healthy', uptime: process.uptime(), zohoSSOConfigured: !!(CFG.ZOHO_CLIENT_ID && CFG.ZOHO_CLIENT_SECRET) }));
 
 // ─────────────────────────────────────────────
 // ROUTES — AUTH
@@ -530,6 +557,105 @@ app.post('/api/auth/login', rateLimit(15 * 60 * 1000, 10), async (req, res) => {
  */
 app.get('/api/auth/me', requireAuth, (req, res) => {
   res.json({ email: req.user.email, role: req.user.role });
+});
+
+// ─────────────────────────────────────────────
+// ZOHO SSO LOGIN — admin login via Zoho account
+// ─────────────────────────────────────────────
+
+/**
+ * GET /api/auth/zoho-login
+ * Redirects browser to Zoho OAuth consent screen for SSO login
+ */
+app.get('/api/auth/zoho-login', (req, res) => {
+  if (!CFG.ZOHO_CLIENT_ID) {
+    return res.status(503).send('Zoho SSO not configured. Set ZOHO_CLIENT_ID in environment variables.');
+  }
+  const params = new URLSearchParams({
+    response_type: 'code',
+    client_id    : CFG.ZOHO_CLIENT_ID,
+    scope        : 'ZohoMail.accounts.READ',
+    redirect_uri : CFG.ZOHO_SSO_REDIRECT_URI || (CFG.ALLOWED_ORIGIN + '/api/auth/zoho-callback'),
+    access_type  : 'offline',
+    prompt       : 'consent',
+  });
+  res.redirect('https://accounts.zoho.eu/oauth/v2/auth?' + params.toString());
+});
+
+/**
+ * GET /api/auth/zoho-callback
+ * Zoho redirects here after user approves — exchange code for token,
+ * verify the email matches SUPER_ADMIN_EMAIL, issue JWT
+ */
+app.get('/api/auth/zoho-callback', async (req, res) => {
+  const { code, error } = req.query;
+  if (error || !code) {
+    return res.redirect('/login.html?error=zoho_cancelled');
+  }
+  try {
+    // Exchange code for access token
+    const tokenBody = new URLSearchParams({
+      grant_type   : 'authorization_code',
+      client_id    : CFG.ZOHO_CLIENT_ID,
+      client_secret: CFG.ZOHO_CLIENT_SECRET,
+      redirect_uri : CFG.ZOHO_SSO_REDIRECT_URI || (CFG.ALLOWED_ORIGIN + '/api/auth/zoho-callback'),
+      code,
+    }).toString();
+
+    const tokenData = await new Promise((resolve, reject) => {
+      const req2 = https.request({
+        hostname: 'accounts.zoho.eu',
+        path    : '/oauth/v2/token',
+        method  : 'POST',
+        headers : { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(tokenBody) },
+      }, (r) => {
+        let d = '';
+        r.on('data', c => d += c);
+        r.on('end', () => resolve(JSON.parse(d)));
+      });
+      req2.on('error', reject);
+      req2.write(tokenBody);
+      req2.end();
+    });
+
+    if (!tokenData.access_token) {
+      console.error('[zoho-sso] Token exchange failed:', tokenData);
+      return res.redirect('/login.html?error=zoho_token_failed');
+    }
+
+    // Get user info from Zoho
+    const userInfo = await new Promise((resolve, reject) => {
+      const req3 = https.request({
+        hostname: 'accounts.zoho.eu',
+        path    : '/oauth/v2/userinfo',
+        method  : 'GET',
+        headers : { 'Authorization': 'Zoho-oauthtoken ' + tokenData.access_token },
+      }, (r) => {
+        let d = '';
+        r.on('data', c => d += c);
+        r.on('end', () => resolve(JSON.parse(d)));
+      });
+      req3.on('error', reject);
+      req3.end();
+    });
+
+    const zohoEmail = (userInfo.email || '').toLowerCase();
+
+    // Check if this Zoho account matches the super admin email
+    if (zohoEmail !== CFG.SUPER_ADMIN_EMAIL.toLowerCase()) {
+      console.warn('[zoho-sso] Unauthorised Zoho login attempt:', zohoEmail);
+      return res.redirect('/login.html?error=zoho_unauthorised');
+    }
+
+    // Issue JWT and redirect to admin
+    const token = makeToken({ email: zohoEmail, role: 'superadmin' });
+    // Pass token via URL fragment (never logged by servers)
+    res.redirect('/admin.html#sso=' + token);
+
+  } catch (err) {
+    console.error('[zoho-sso] Error:', err.message);
+    res.redirect('/login.html?error=zoho_error');
+  }
 });
 
 // ─────────────────────────────────────────────
@@ -694,14 +820,16 @@ app.delete('/api/contacts/:id', requireSuperAdmin, (req, res) => {
  * Accepts optional cvBase64 and uploads to Cloudinary
  */
 app.post('/api/applications', async (req, res) => {
-  let cvUrl = null;
+  let cvUrl = req.body.cvUrl || null;  // accept direct URL first
+
+  // If base64 provided, try Cloudinary upload (overwrites direct URL if successful)
   if (req.body.cvBase64) {
     try {
       const up = await cloudinaryUpload(req.body.cvBase64, 'covenantcrest/cvs', `cv-${uid()}`);
       cvUrl = up.url;
     } catch (e) {
-      console.error('CV upload failed:', e.message);
-      // Non-fatal
+      console.error('CV upload failed (Cloudinary not configured):', e.message);
+      // cvUrl stays as whatever was passed directly, or null
     }
   }
 
@@ -725,10 +853,11 @@ app.post('/api/applications', async (req, res) => {
   apps.unshift(entry);
   writeJSON(FILES.apps, apps);
 
-  // Email alert
-  sendEmail(emailTpl.newApplicationAlert(entry)).catch(e =>
-    console.error('Application email error:', e.message)
-  );
+  // Email alert to admin + auto-reply confirmation to candidate
+  Promise.allSettled([
+    sendEmail(emailTpl.newApplicationAlert(entry)),
+    entry.email ? sendEmail({ ...emailTpl.applicationAutoReply(entry), to: entry.email }) : Promise.resolve(),
+  ]).catch(e => console.error('Application email error:', e.message));
 
   res.status(201).json({ success: true, id: entry.id });
 });
@@ -845,15 +974,48 @@ app.post('/api/netlify-webhook', async (req, res) => {
 
   const payload = req.body;
   const data    = payload.data || payload;
+  const formName = sanitise(payload.form_name || data.form_name || '', 80);
 
+  // ── Route candidate-apply to Applications ────────────────────
+  if (formName === 'candidate-apply') {
+    const entry = {
+      id          : uid(),
+      first_name  : sanitise(data.first_name || data.name?.split(' ')[0] || '', 60),
+      last_name   : sanitise(data.last_name  || data.name?.split(' ').slice(1).join(' ') || '', 60),
+      email       : sanitise(data.email       || '', 200),
+      phone       : sanitise(data.phone       || '', 30),
+      sector      : sanitise(data.sector      || '', 40),
+      job_id      : sanitise(data.job_id      || '', 30),
+      job_title   : sanitise(data.job_title   || data['job-title'] || '', 120),
+      availability: sanitise(data.availability || '', 50),
+      notes       : sanitise(data.notes || data.message || '', 2000),
+      cvUrl       : null,
+      status      : 'new',
+      source      : 'netlify-form',
+      date        : new Date().toISOString(),
+    };
+    const apps = readJSON(FILES.apps);
+    apps.unshift(entry);
+    writeJSON(FILES.apps, apps);
+
+    // Alert to admin + confirmation to candidate
+    Promise.allSettled([
+      sendEmail(emailTpl.newApplicationAlert(entry)),
+      entry.email ? sendEmail(emailTpl.applicationAutoReply(entry)) : Promise.resolve(),
+    ]);
+
+    return res.json({ received: true, id: entry.id, routed: 'applications' });
+  }
+
+  // ── All other forms → Contact Enquiries ──────────────────────
   const contact = {
     id     : uid(),
     name   : sanitise(data.name || data.first_name || '', 120),
     email  : sanitise(data.email || '', 200),
     phone  : sanitise(data.phone || '', 30),
-    type   : sanitise(data.enquiry_type || data.type || payload.form_name || 'general', 40),
+    type   : sanitise(data.enquiry_type || data.type || formName || 'general', 40),
     message: sanitise(data.message || data.notes || '', 3000),
-    source : sanitise(payload.form_name || 'netlify-webhook', 50),
+    source : sanitise(formName || 'netlify-webhook', 50),
     status : 'new',
     date   : new Date().toISOString(),
   };
@@ -862,13 +1024,12 @@ app.post('/api/netlify-webhook', async (req, res) => {
   contacts.unshift(contact);
   writeJSON(FILES.contacts, contacts);
 
-  // Email alert + auto-reply
   Promise.allSettled([
     sendEmail(emailTpl.newEnquiryAlert(contact)),
     contact.email ? sendEmail({ ...emailTpl.enquiryAutoReply(contact), to: contact.email }) : Promise.resolve(),
   ]);
 
-  res.json({ received: true, id: contact.id });
+  res.json({ received: true, id: contact.id, routed: 'contacts' });
 });
 
 // ─────────────────────────────────────────────
