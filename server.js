@@ -93,10 +93,10 @@ const CFG = {
   EMAIL_FROM        : process.env.EMAIL_FROM        || 'noreply@covenantcrest.co.uk',
   EMAIL_NOTIFY      : process.env.EMAIL_NOTIFY      || 'jaby.k@covenantcrest.co.uk',
 
-  // Cloudinary
-  CLOUDINARY_CLOUD  : process.env.CLOUDINARY_CLOUD_NAME || '',
-  CLOUDINARY_KEY    : process.env.CLOUDINARY_API_KEY    || '',
-  CLOUDINARY_SECRET : process.env.CLOUDINARY_API_SECRET || '',
+  // Cloudinary (trim to avoid env var whitespace issues)
+  CLOUDINARY_CLOUD  : (process.env.CLOUDINARY_CLOUD_NAME || '').trim(),
+  CLOUDINARY_KEY    : (process.env.CLOUDINARY_API_KEY    || '').trim(),
+  CLOUDINARY_SECRET : (process.env.CLOUDINARY_API_SECRET || '').trim(),
 
   // Netlify webhook secret (optional)
   NETLIFY_SECRET    : process.env.NETLIFY_WEBHOOK_SECRET || '',
@@ -493,6 +493,7 @@ function seedDefaultJobs() {
   console.log('✅ Seeded', defaults.length, 'default jobs');
 }
 seedDefaultJobs();
+console.log('[BOOT] Cloudinary — cloud:', CFG.CLOUDINARY_CLOUD, '| key length:', CFG.CLOUDINARY_KEY.length, '| secret length:', CFG.CLOUDINARY_SECRET.length, '| secret ends with:', CFG.CLOUDINARY_SECRET.slice(-3));
 
 // ─────────────────────────────────────────────
 // ROUTES — HEALTH
