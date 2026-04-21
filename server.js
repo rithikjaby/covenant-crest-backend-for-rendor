@@ -776,6 +776,15 @@ app.get('/api/jobs/all', requireAuth, (req, res) => {
   res.json(readJSON(FILES.jobs));
 });
 
+/** GET /api/jobs/:id — single public job by ID */
+app.get('/api/jobs/:id', (req, res) => {
+  const jobs = readJSON(FILES.jobs);
+  const job  = jobs.find(j => j.id === req.params.id && j.status === 'active');
+  if (!job) return res.status(404).json({ error: 'Job not found.' });
+  const { id, title, sector, type, location, pay, desc, req: requirements, posted, imageUrl } = job;
+  res.json({ id, title, sector, type, location, pay, desc, req: requirements, posted, imageUrl });
+});
+
 /** POST /api/jobs — create job (auth required) */
 app.post('/api/jobs', requireAuth, async (req, res) => {
   const { title, pay, sector, type, location, desc, req: requirements, status, imageBase64 } = req.body;
