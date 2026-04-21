@@ -93,7 +93,7 @@ const CFG = {
   EMAIL_FROM        : process.env.EMAIL_FROM        || 'noreply@covenantcrest.co.uk',
   EMAIL_NOTIFY      : process.env.EMAIL_NOTIFY      || 'jaby.k@covenantcrest.co.uk',
 
-  // Cloudinary (trim to avoid env var whitespace issues)
+  // Cloudinary (will also check CLOUDINARY_URL below)
   CLOUDINARY_CLOUD  : (process.env.CLOUDINARY_CLOUD_NAME || '').trim(),
   CLOUDINARY_KEY    : (process.env.CLOUDINARY_API_KEY    || '').trim(),
   CLOUDINARY_SECRET : (process.env.CLOUDINARY_API_SECRET || '').trim(),
@@ -112,6 +112,16 @@ const CFG = {
   ZOHO_FROM_EMAIL    : process.env.ZOHO_FROM_EMAIL    || 'jaby.k@covenantcrest.co.uk',
   ZOHO_FROM_NAME     : process.env.ZOHO_FROM_NAME     || 'Covenant Crest Group',
 };
+
+// Extract from CLOUDINARY_URL if provided (cloudinary://key:secret@cloud)
+if (process.env.CLOUDINARY_URL) {
+  const match = process.env.CLOUDINARY_URL.match(/cloudinary:\/\/([^:]+):([^@]+)@(.+)/);
+  if (match) {
+    CFG.CLOUDINARY_KEY    = match[1].trim();
+    CFG.CLOUDINARY_SECRET = match[2].trim();
+    CFG.CLOUDINARY_CLOUD  = match[3].trim();
+  }
+}
 
 // ─────────────────────────────────────────────
 // DATA DIRECTORY & FILE PATHS
