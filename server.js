@@ -154,6 +154,8 @@ function uid() {
 }
 
 function sanitise(str, max = 500) {
+  // Netlify webhooks can send repeated fields as arrays — take first element
+  if (Array.isArray(str)) str = str[0];
   if (typeof str !== 'string') return '';
   return str.trim().slice(0, max);
 }
