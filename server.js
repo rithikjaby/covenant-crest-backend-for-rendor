@@ -931,13 +931,18 @@ app.post('/api/applications', async (req, res) => {
 
   // If base64 provided, try Cloudinary upload (overwrites direct URL if successful)
   if (req.body.cvBase64) {
+    console.log('[CV Upload] cvBase64 received, length:', req.body.cvBase64.length, 'chars, starts with:', req.body.cvBase64.substring(0, 20));
+    console.log('[CV Upload] Cloudinary config — cloud:', CFG.CLOUDINARY_CLOUD ? 'SET' : 'EMPTY', 'key:', CFG.CLOUDINARY_KEY ? 'SET' : 'EMPTY', 'secret:', CFG.CLOUDINARY_SECRET ? 'SET' : 'EMPTY');
     try {
       const up = await cloudinaryUpload(req.body.cvBase64, 'covenantcrest/cvs', `cv-${uid()}`);
       cvUrl = up.url;
+      console.log('[CV Upload] SUCCESS — Cloudinary URL:', cvUrl);
     } catch (e) {
-      console.error('CV upload failed (Cloudinary not configured):', e.message);
+      console.error('[CV Upload] FAILED:', e.message);
       // cvUrl stays as whatever was passed directly, or null
     }
+  } else {
+    console.log('[CV Upload] No cvBase64 in request body. Keys received:', Object.keys(req.body).join(', '));
   }
 
   const entry = {
