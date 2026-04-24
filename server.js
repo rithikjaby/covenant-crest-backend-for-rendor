@@ -58,6 +58,8 @@ const fs       = require('fs');
 const path     = require('path');
 const crypto   = require('crypto');
 const https    = require('https');
+const helmet   = require('helmet');
+const bcrypt   = require('bcrypt');
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
@@ -134,6 +136,7 @@ const FILES = {
   contacts: path.join(DATA_DIR, 'contacts.json'),
   users   : path.join(DATA_DIR, 'users.json'),
   apps    : path.join(DATA_DIR, 'applications.json'),
+  security: path.join(DATA_DIR, 'security.json'),
 };
 
 // ─────────────────────────────────────────────
@@ -170,40 +173,54 @@ function sanitise(str, max = 500) {
   return str.trim().slice(0, max);
 }
 
+/**
+ * Log security events (failed logins, password changes)
+ */
+function logSecurityEvent(type, email, req, details = {}) {
+  try {
+    const logs = readJSON(FILES.security);
+    logs.unshift({
+      id: uid(),
+      timestamp: new Date().toISOString(),
+      type,
+      email: email.toLowerCase(),
+      ip: req.ip || req.headers['x-forwarded-for'] || 'unknown',
+      userAgent: req.headers['user-agent'],
+      ...details
+    });
+    // Keep only last 200 events
+    writeJSON(FILES.security, logs.slice(0, 200));
+  } catch (e) { console.error('Security log failed:', e.message); }
+}
+
 // ─────────────────────────────────────────────
-// PASSWORD HASHING  (bcrypt-style using Node crypto)
-// We use PBKDF2 so we don't need an extra npm package.
-// To upgrade to bcrypt later: npm install bcrypt
+// PASSWORD HASHING (bcrypt)
 // ─────────────────────────────────────────────
 async function hashPassword(pwd) {
-  return new Promise((resolve, reject) => {
-    const salt = crypto.randomBytes(16).toString('hex');
-    crypto.pbkdf2(pwd, salt, 100_000, 64, 'sha512', (err, key) => {
-      if (err) return reject(err);
-      resolve(`pbkdf2$${salt}$${key.toString('hex')}`);
-    });
-  });
+  return bcrypt.hash(pwd, 12);
 }
 
 async function verifyPassword(pwd, stored) {
-  return new Promise((resolve, reject) => {
-    try {
-      // Plain-text fallback — covers env var passwords and legacy accounts
-      if (!stored || !stored.startsWith('pbkdf2$')) {
-        return resolve(pwd === stored);
-      }
-      const parts = stored.split('$');
-      if (parts.length !== 3) return resolve(pwd === stored);
-      const salt = parts[1];
-      const hash = parts[2];
-      crypto.pbkdf2(pwd, salt, 100000, 64, 'sha512', (err, key) => {
-        if (err) return reject(err);
-        resolve(key.toString('hex') === hash);
-      });
-    } catch (e) {
-      reject(e);
-    }
-  });
+  if (!stored) return false;
+  // Fallback for legacy plain-text passwords
+  if (!stored.startsWith('$2') && !stored.startsWith('pbkdf2$')) {
+    return pwd === stored;
+  }
+  // Fallback for previous PBKDF2 implementation
+  if (stored.startsWith('pbkdf2$')) {
+    return new Promise((resolve, reject) => {
+      try {
+        const parts = stored.split('$');
+        const salt = parts[1];
+        const hash = parts[2];
+        crypto.pbkdf2(pwd, salt, 100000, 64, 'sha512', (err, key) => {
+          if (err) return reject(err);
+          resolve(key.toString('hex') === hash);
+        });
+      } catch (e) { resolve(false); }
+    });
+  }
+  return bcrypt.compare(pwd, stored);
 }
 
 // ─────────────────────────────────────────────
@@ -447,6 +464,11 @@ function rateLimit(windowMs, max) {
 // ─────────────────────────────────────────────
 app.set('trust proxy', 1);
 
+// Security Headers
+app.use(helmet({
+  contentSecurityPolicy: false, // Netlify handles CSP for the frontend
+}));
+
 app.use(cors({
   origin(origin, cb) {
     const allowed = [
@@ -527,9 +549,15 @@ app.get('/api/health', (req, res) => res.json({ status: 'healthy', uptime: proce
  * Body: { email, password }
  * Returns: { token, role, email }
  */
-app.post('/api/auth/login', rateLimit(15 * 60 * 1000, 10), async (req, res) => {
-  const { email = '', password = '' } = req.body;
+app.post('/api/auth/login', rateLimit(15 * 60 * 1000, 5), async (req, res) => {
+  const { email = '', password = '', honeypot = '' } = req.body;
   const emailLc = email.trim().toLowerCase();
+
+  // Honeypot check for bots
+  if (honeypot) {
+    console.warn('[security] Honeypot triggered by IP:', req.ip);
+    return res.status(401).json({ error: 'Invalid request.' });
+  }
 
   if (!emailLc || !password) {
     return res.status(400).json({ error: 'Email and password are required.' });
@@ -542,7 +570,6 @@ app.post('/api/auth/login', rateLimit(15 * 60 * 1000, 10), async (req, res) => {
       try {
         match = await verifyPassword(password, CFG.SUPER_ADMIN_PWD);
       } catch (e) {
-        // fallback: direct comparison (handles plain-text env vars)
         match = (password === CFG.SUPER_ADMIN_PWD);
       }
       if (match) {
@@ -552,8 +579,9 @@ app.post('/api/auth/login', rateLimit(15 * 60 * 1000, 10), async (req, res) => {
           email: emailLc,
         });
       }
-      // Add consistent delay to prevent timing attacks
-      await new Promise(r => setTimeout(r, 200 + Math.random() * 100));
+      // Log failed attempt
+      logSecurityEvent('failed_login', emailLc, req, { role: 'superadmin' });
+      await new Promise(r => setTimeout(r, 400 + Math.random() * 200));
       return res.status(401).json({ error: 'Invalid email or password.' });
     }
 
@@ -576,22 +604,13 @@ app.post('/api/auth/login', rateLimit(15 * 60 * 1000, 10), async (req, res) => {
       }
     }
 
-    await new Promise(r => setTimeout(r, 200 + Math.random() * 100));
+    // Log failed attempt
+    logSecurityEvent('failed_login', emailLc, req, { exists: !!user });
+    await new Promise(r => setTimeout(r, 400 + Math.random() * 200));
     return res.status(401).json({ error: 'Invalid email or password.' });
 
   } catch (err) {
     console.error('Login error:', err.message);
-    // Last-resort: try plain text comparison before giving up
-    try {
-      if (email.trim().toLowerCase() === CFG.SUPER_ADMIN_EMAIL.toLowerCase() &&
-          password === CFG.SUPER_ADMIN_PWD) {
-        return res.json({
-          token: makeToken({ email: email.trim().toLowerCase(), role: 'superadmin' }),
-          role : 'superadmin',
-          email: email.trim().toLowerCase(),
-        });
-      }
-    } catch (e2) { /* ignore */ }
     return res.status(500).json({ error: 'Login failed. Please try again.' });
   }
 });
@@ -628,6 +647,7 @@ app.post('/api/auth/change-password', requireSuperAdmin, async (req, res) => {
     // Also write to a local file so it survives restarts on Render
     const pwFile = path.join(DATA_DIR, '.admin_pw');
     fs.writeFileSync(pwFile, hashed, 'utf8');
+    logSecurityEvent('password_change', CFG.SUPER_ADMIN_EMAIL, req);
     console.log('[auth] Super admin password changed successfully');
     return res.json({ success: true, message: 'Password changed successfully. Update SUPER_ADMIN_PWD in Render to make it permanent.' });
   } catch(e) {
@@ -640,6 +660,13 @@ app.post('/api/auth/change-password', requireSuperAdmin, async (req, res) => {
  */
 app.get('/api/auth/me', requireAuth, (req, res) => {
   res.json({ email: req.user.email, role: req.user.role });
+});
+
+/**
+ * GET /api/security-logs — Super Admin only
+ */
+app.get('/api/security-logs', requireSuperAdmin, (req, res) => {
+  res.json(readJSON(FILES.security));
 });
 
 // ─────────────────────────────────────────────

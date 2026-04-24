@@ -1,0 +1,74 @@
+[
+  {
+    "id": "mo930dqxnzqv6",
+    "title": "Care Assistant",
+    "sector": "care",
+    "type": "full-time",
+    "location": "Telford",
+    "pay": "£11.44–12.50/hr",
+    "desc": "Compassionate care assistant needed in Telford to support elderly residents with daily living, personal care and companionship.",
+    "req": "Enhanced DBS required. Experience preferred but not essential. Full training provided.",
+    "status": "active",
+    "posted": "2026-04-21T20:33:58.425Z"
+  },
+  {
+    "id": "mo930dqyvoygb",
+    "title": "Night Care Worker",
+    "sector": "care",
+    "type": "full-time",
+    "location": "Telford",
+    "pay": "£12.00–13.50/hr",
+    "desc": "Night shift care worker for a residential care home in Telford. Overnight personal care, medication and safety monitoring.",
+    "req": "Enhanced DBS. Night working experience preferred.",
+    "status": "active",
+    "posted": "2026-04-21T20:33:58.426Z"
+  },
+  {
+    "id": "mo930dqy2dwi1",
+    "title": "SIA Door Supervisor",
+    "sector": "security",
+    "type": "full-time",
+    "location": "Birmingham",
+    "pay": "£13.00–15.00/hr",
+    "desc": "Licensed Door Supervisor for various Birmingham city centre venues. Day and night shifts available.",
+    "req": "Valid SIA Door Supervisor licence mandatory. Minimum 1 year experience.",
+    "status": "active",
+    "posted": "2026-04-21T20:33:58.426Z"
+  },
+  {
+    "id": "mo930dqyqo6gs",
+    "title": "Retail Security Officer",
+    "sector": "security",
+    "type": "part-time",
+    "location": "Wolverhampton",
+    "pay": "£11.44–12.50/hr",
+    "desc": "Retail security officer for a busy retail park in Wolverhampton. Loss prevention and customer service.",
+    "req": "SIA licence preferred.",
+    "status": "active",
+    "posted": "2026-04-21T20:33:58.426Z"
+  },
+  {
+    "id": "mo930dqykv8lj",
+    "title": "Warehouse Operative",
+    "sector": "warehouse",
+    "type": "temporary",
+    "location": "Telford",
+    "pay": "£11.44/hr",
+    "desc": "Warehouse operatives required immediately for a busy distribution centre. Picking, packing, goods-in and despatch.",
+    "req": "No experience necessary. Steel-toed boots required.",
+    "status": "active",
+    "posted": "2026-04-21T20:33:58.426Z"
+  },
+  {
+    "id": "mo930dqyqs60v",
+    "title": "FLT Driver",
+    "sector": "warehouse",
+    "type": "permanent",
+    "location": "Shrewsbury",
+    "pay": "£13.00–14.50/hr",
+    "desc": "Experienced forklift truck driver required for a manufacturing site in Shrewsbury.",
+    "req": "Valid FLT licence (counter-balance essential). 2+ years experience.",
+    "status": "active",
+    "posted": "2026-04-21T20:33:58.426Z"
+  }
+]
