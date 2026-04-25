@@ -44,6 +44,8 @@
 
 'use strict';
 
+require('dotenv').config();
+
 // ─────────────────────────────────────────────
 // PLATFORM COMPATIBILITY
 // Works on: Render.com, Railway.app, Heroku, Fly.io, VPS, local
@@ -60,6 +62,7 @@ const crypto   = require('crypto');
 const https    = require('https');
 const helmet   = require('helmet');
 const bcrypt   = require('bcrypt');
+const mongoose = require('mongoose');
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
@@ -113,6 +116,9 @@ const CFG = {
   ZOHO_REFRESH_TOKEN : process.env.ZOHO_REFRESH_TOKEN || '',   // set after first authorisation
   ZOHO_FROM_EMAIL    : process.env.ZOHO_FROM_EMAIL    || 'jaby.k@covenantcrest.co.uk',
   ZOHO_FROM_NAME     : process.env.ZOHO_FROM_NAME     || 'Covenant Crest Group',
+
+  // Database
+  MONGODB_URI        : process.env.MONGODB_URI        || '',
 };
 
 // Extract from CLOUDINARY_URL if provided (cloudinary://key:secret@cloud)
@@ -140,7 +146,70 @@ const FILES = {
 };
 
 // ─────────────────────────────────────────────
-// JSON FILE HELPERS
+// DATABASE CONNECTION
+// ─────────────────────────────────────────────
+if (CFG.MONGODB_URI) {
+  mongoose.connect(CFG.MONGODB_URI)
+    .then(() => console.log('✅ Connected to MongoDB'))
+    .catch(err => console.error('❌ MongoDB Connection Error:', err));
+} else {
+  console.warn('⚠ No MONGODB_URI provided. Data will NOT be persistent after server restarts!');
+}
+
+// Define Schemas
+const JobSchema = new mongoose.Schema({
+  id: { type: String, unique: true },
+  title: String,
+  pay: String,
+  sector: String,
+  type: String,
+  location: String,
+  status: { type: String, default: 'active' },
+  desc: String,
+  req: String,
+  imageUrl: String,
+  closingDate: String,
+  seoKeywords: String,
+  seoDesc: String,
+  date: { type: Date, default: Date.now }
+}, { timestamps: true });
+
+const ContactSchema = new mongoose.Schema({
+  id: { type: String, unique: true },
+  name: String,
+  email: String,
+  phone: String,
+  type: String,
+  message: String,
+  source: String,
+  read: { type: Boolean, default: false },
+  date: { type: Date, default: Date.now }
+}, { timestamps: true });
+
+const AppSchema = new mongoose.Schema({
+  id: { type: String, unique: true },
+  first_name: String,
+  last_name: String,
+  email: String,
+  phone: String,
+  job_id: String,
+  job_title: String,
+  sector: String,
+  availability: String,
+  notes: String,
+  adminNotes: String,
+  cvUrl: String,
+  cvBase64: String, // though we prefer Cloudinary
+  status: { type: String, default: 'new' },
+  date: { type: Date, default: Date.now }
+}, { timestamps: true });
+
+const Job = mongoose.models.Job || mongoose.model('Job', JobSchema);
+const Contact = mongoose.models.Contact || mongoose.model('Contact', ContactSchema);
+const Application = mongoose.models.Application || mongoose.model('Application', AppSchema);
+
+// ─────────────────────────────────────────────
+// JSON FILE HELPERS (Kept for fallback/migration)
 // ─────────────────────────────────────────────
 function readJSON(filePath, def = []) {
   try {
@@ -510,21 +579,25 @@ function requireSuperAdmin(req, res, next) {
 // ─────────────────────────────────────────────
 // SEED DEFAULT JOBS
 // ─────────────────────────────────────────────
-function seedDefaultJobs() {
-  const jobs = readJSON(FILES.jobs);
-  if (jobs.length > 0) return;
-  const defaults = [
-    { id: uid(), title: 'Care Assistant',       sector: 'care',      type: 'full-time',  location: 'Telford',       pay: '£11.44–12.50/hr', desc: 'Compassionate care assistant needed in Telford to support elderly residents with daily living, personal care and companionship.', req: 'Enhanced DBS required. Experience preferred but not essential. Full training provided.', status: 'active', posted: new Date().toISOString() },
-    { id: uid(), title: 'Night Care Worker',     sector: 'care',      type: 'full-time',  location: 'Telford',       pay: '£12.00–13.50/hr', desc: 'Night shift care worker for a residential care home in Telford. Overnight personal care, medication and safety monitoring.',         req: 'Enhanced DBS. Night working experience preferred.',                                   status: 'active', posted: new Date().toISOString() },
-    { id: uid(), title: 'SIA Door Supervisor',   sector: 'security',  type: 'full-time',  location: 'Birmingham',    pay: '£13.00–15.00/hr', desc: 'Licensed Door Supervisor for various Birmingham city centre venues. Day and night shifts available.',                               req: 'Valid SIA Door Supervisor licence mandatory. Minimum 1 year experience.',              status: 'active', posted: new Date().toISOString() },
-    { id: uid(), title: 'Retail Security Officer',sector: 'security', type: 'part-time',  location: 'Wolverhampton', pay: '£11.44–12.50/hr', desc: 'Retail security officer for a busy retail park in Wolverhampton. Loss prevention and customer service.',                           req: 'SIA licence preferred.',                                                              status: 'active', posted: new Date().toISOString() },
-    { id: uid(), title: 'Warehouse Operative',   sector: 'warehouse', type: 'temporary',  location: 'Telford',       pay: '£11.44/hr',       desc: 'Warehouse operatives required immediately for a busy distribution centre. Picking, packing, goods-in and despatch.',              req: 'No experience necessary. Steel-toed boots required.',                                 status: 'active', posted: new Date().toISOString() },
-    { id: uid(), title: 'FLT Driver',            sector: 'warehouse', type: 'permanent',  location: 'Shrewsbury',    pay: '£13.00–14.50/hr', desc: 'Experienced forklift truck driver required for a manufacturing site in Shrewsbury.',                                               req: 'Valid FLT licence (counter-balance essential). 2+ years experience.',                 status: 'active', posted: new Date().toISOString() },
-  ];
-  writeJSON(FILES.jobs, defaults);
-  console.log('✅ Seeded', defaults.length, 'default jobs');
+async function seedDefaultJobs() {
+  try {
+    const count = await Job.countDocuments();
+    if (count > 0) return;
+    const defaults = [
+      { id: uid(), title: 'Care Assistant',       sector: 'care',      type: 'full-time',  location: 'Telford',       pay: '£11.44–12.50/hr', desc: 'Compassionate care assistant needed in Telford to support elderly residents with daily living, personal care and companionship.', req: 'Enhanced DBS required. Experience preferred but not essential. Full training provided.', status: 'active' },
+      { id: uid(), title: 'Night Care Worker',     sector: 'care',      type: 'full-time',  location: 'Telford',       pay: '£12.00–13.50/hr', desc: 'Night shift care worker for a residential care home in Telford. Overnight personal care, medication and safety monitoring.',         req: 'Enhanced DBS. Night working experience preferred.',                                   status: 'active' },
+      { id: uid(), title: 'SIA Door Supervisor',   sector: 'security',  type: 'full-time',  location: 'Birmingham',    pay: '£13.00–15.00/hr', desc: 'Licensed Door Supervisor for various Birmingham city centre venues. Day and night shifts available.',                               req: 'Valid SIA Door Supervisor licence mandatory. Minimum 1 year experience.',              status: 'active' },
+      { id: uid(), title: 'Retail Security Officer',sector: 'security', type: 'part-time',  location: 'Wolverhampton', pay: '£11.44–12.50/hr', desc: 'Retail security officer for a busy retail park in Wolverhampton. Loss prevention and customer service.',                           req: 'SIA licence preferred.',                                                              status: 'active' },
+      { id: uid(), title: 'Warehouse Operative',   sector: 'warehouse', type: 'temporary',  location: 'Telford',       pay: '£11.44/hr',       desc: 'Warehouse operatives required immediately for a busy distribution centre. Picking, packing, goods-in and despatch.',              req: 'No experience necessary. Steel-toed boots required.',                                 status: 'active' },
+      { id: uid(), title: 'FLT Driver',            sector: 'warehouse', type: 'permanent',  location: 'Shrewsbury',    pay: '£13.00–14.50/hr', desc: 'Experienced forklift truck driver required for a manufacturing site in Shrewsbury.',                                               req: 'Valid FLT licence (counter-balance essential). 2+ years experience.',                 status: 'active' },
+    ];
+    await Job.insertMany(defaults);
+    console.log('✅ Seeded', defaults.length, 'default jobs to MongoDB');
+  } catch(e) { console.error('Seeding failed:', e.message); }
 }
-seedDefaultJobs();
+if (CFG.MONGODB_URI) {
+  seedDefaultJobs();
+}
 console.log('[BOOT] Cloudinary — cloud:', CFG.CLOUDINARY_CLOUD, '| key length:', CFG.CLOUDINARY_KEY.length, '| secret length:', CFG.CLOUDINARY_SECRET.length, '| secret ends with:', CFG.CLOUDINARY_SECRET.slice(-3));
 
 // ─────────────────────────────────────────────
@@ -799,35 +872,39 @@ app.get('/api/auth/zoho-callback', async (req, res) => {
 // ─────────────────────────────────────────────
 
 /** GET /api/jobs  — public, active jobs only */
-app.get('/api/jobs', (req, res) => {
-  let jobs = readJSON(FILES.jobs).filter(j => j.status === 'active');
-  const { sector, type, location } = req.query;
-  if (sector)   jobs = jobs.filter(j => j.sector === sector);
-  if (type)     jobs = jobs.filter(j => j.type   === type);
-  if (location) jobs = jobs.filter(j => (j.location || '').toLowerCase().includes(location.toLowerCase()));
+app.get('/api/jobs', async (req, res) => {
+  try {
+    let query = { status: 'active' };
+    const { sector, type, location } = req.query;
+    if (sector)   query.sector = sector;
+    if (type)     query.type   = type;
+    if (location) query.location = { $regex: location, $options: 'i' };
 
-  res.json(jobs.map(({ id, title, sector, type, location, pay, desc, req: requirements, posted, imageUrl }) => ({
-    id, title, sector, type, location, pay, desc, req: requirements, posted, imageUrl,
-  })));
+    const jobs = await Job.find(query).sort({ createdAt: -1 });
+    res.json(jobs);
+  } catch(e) { res.status(500).json({ error: 'Failed to fetch jobs' }); }
 });
 
 /** GET /api/jobs/all — all jobs (auth required) */
-app.get('/api/jobs/all', requireAuth, (req, res) => {
-  res.json(readJSON(FILES.jobs));
+app.get('/api/jobs/all', requireAuth, async (req, res) => {
+  try {
+    const jobs = await Job.find().sort({ createdAt: -1 });
+    res.json(jobs);
+  } catch(e) { res.status(500).json({ error: 'Failed to fetch jobs' }); }
 });
 
 /** GET /api/jobs/:id — single public job by ID */
-app.get('/api/jobs/:id', (req, res) => {
-  const jobs = readJSON(FILES.jobs);
-  const job  = jobs.find(j => j.id === req.params.id && j.status === 'active');
-  if (!job) return res.status(404).json({ error: 'Job not found.' });
-  const { id, title, sector, type, location, pay, desc, req: requirements, posted, imageUrl } = job;
-  res.json({ id, title, sector, type, location, pay, desc, req: requirements, posted, imageUrl });
+app.get('/api/jobs/:id', async (req, res) => {
+  try {
+    const job = await Job.findOne({ id: req.params.id, status: 'active' });
+    if (!job) return res.status(404).json({ error: 'Job not found.' });
+    res.json(job);
+  } catch(e) { res.status(500).json({ error: 'Failed to fetch job' }); }
 });
 
 /** POST /api/jobs — create job (auth required) */
 app.post('/api/jobs', requireAuth, async (req, res) => {
-  const { title, pay, sector, type, location, desc, req: requirements, status, imageBase64 } = req.body;
+  const { title, pay, sector, type, location, desc, req: requirements, status, imageBase64, closingDate, seoKeywords, seoDesc } = req.body;
   if (!title || !pay) return res.status(400).json({ error: 'Title and pay are required.' });
 
   let imageUrl = null;
@@ -835,59 +912,56 @@ app.post('/api/jobs', requireAuth, async (req, res) => {
     try {
       const uploaded = await cloudinaryUpload(imageBase64, 'covenantcrest/jobs', `job-${uid()}`);
       imageUrl = uploaded.url;
-    } catch (e) {
-      console.error('Cloudinary job image upload failed:', e.message);
-      // Non-fatal — job saved without image
-    }
+    } catch (e) { console.error('Cloudinary upload failed:', e.message); }
   }
 
-  const job = {
-    id       : uid(),
-    title    : sanitise(title, 120),
-    pay      : sanitise(pay,   60),
-    sector   : sanitise(sector || 'care',       30),
-    type     : sanitise(type   || 'full-time',  30),
-    location : sanitise(location || '', 100),
-    desc     : sanitise(desc     || '', 5000),
-    req      : sanitise(requirements || '', 3000),
-    status   : ['active', 'inactive'].includes(status) ? status : 'active',
-    imageUrl,
-    posted   : new Date().toISOString(),
-    createdBy: req.user.email,
-  };
-  const jobs = readJSON(FILES.jobs);
-  jobs.unshift(job);
-  writeJSON(FILES.jobs, jobs);
-  res.status(201).json(job);
+  try {
+    const job = new Job({
+      id       : uid(),
+      title    : sanitise(title, 120),
+      pay      : sanitise(pay,   60),
+      sector   : sanitise(sector || 'care',       30),
+      type     : sanitise(type   || 'full-time',  30),
+      location : sanitise(location || '', 100),
+      desc     : sanitise(desc     || '', 8000),
+      req      : sanitise(requirements || '', 5000),
+      status   : ['active', 'inactive'].includes(status) ? status : 'active',
+      imageUrl,
+      closingDate,
+      seoKeywords,
+      seoDesc,
+    });
+    await job.save();
+    res.status(201).json(job);
+  } catch(e) { res.status(500).json({ error: 'Failed to create job' }); }
 });
 
 /** PUT /api/jobs/:id — update job */
 app.put('/api/jobs/:id', requireAuth, async (req, res) => {
-  const jobs = readJSON(FILES.jobs);
-  const idx  = jobs.findIndex(j => j.id === req.params.id);
-  if (idx === -1) return res.status(404).json({ error: 'Job not found.' });
+  try {
+    const { imageBase64, ...rest } = req.body;
+    let updateData = { ...rest };
+    
+    if (imageBase64) {
+      try {
+        const up = await cloudinaryUpload(imageBase64, 'covenantcrest/jobs', `job-${req.params.id}`);
+        updateData.imageUrl = up.url;
+      } catch (e) { console.error('Cloudinary update failed:', e.message); }
+    }
 
-  let imageUrl = jobs[idx].imageUrl;
-  if (req.body.imageBase64) {
-    try {
-      const up = await cloudinaryUpload(req.body.imageBase64, 'covenantcrest/jobs', `job-${jobs[idx].id}`);
-      imageUrl = up.url;
-    } catch (e) { console.error('Cloudinary update failed:', e.message); }
-  }
-
-  const { imageBase64: _drop, ...rest } = req.body;
-  jobs[idx] = { ...jobs[idx], ...rest, id: jobs[idx].id, imageUrl, updatedAt: new Date().toISOString() };
-  writeJSON(FILES.jobs, jobs);
-  res.json(jobs[idx]);
+    const job = await Job.findOneAndUpdate({ id: req.params.id }, updateData, { new: true });
+    if (!job) return res.status(404).json({ error: 'Job not found.' });
+    res.json(job);
+  } catch(e) { res.status(500).json({ error: 'Failed to update job' }); }
 });
 
 /** DELETE /api/jobs/:id */
-app.delete('/api/jobs/:id', requireAuth, (req, res) => {
-  const jobs     = readJSON(FILES.jobs);
-  const filtered = jobs.filter(j => j.id !== req.params.id);
-  if (filtered.length === jobs.length) return res.status(404).json({ error: 'Job not found.' });
-  writeJSON(FILES.jobs, filtered);
-  res.json({ success: true });
+app.delete('/api/jobs/:id', requireAuth, async (req, res) => {
+  try {
+    const result = await Job.deleteOne({ id: req.params.id });
+    if (result.deletedCount === 0) return res.status(404).json({ error: 'Job not found.' });
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: 'Failed to delete job' }); }
 });
 
 // ─────────────────────────────────────────────
@@ -895,8 +969,11 @@ app.delete('/api/jobs/:id', requireAuth, (req, res) => {
 // ─────────────────────────────────────────────
 
 /** GET /api/contacts — protected */
-app.get('/api/contacts', requireAuth, (req, res) => {
-  res.json(readJSON(FILES.contacts));
+app.get('/api/contacts', requireAuth, async (req, res) => {
+  try {
+    const contacts = await Contact.find().sort({ createdAt: -1 });
+    res.json(contacts);
+  } catch(e) { res.status(500).json({ error: 'Failed to fetch enquiries' }); }
 });
 
 /**
@@ -905,21 +982,18 @@ app.get('/api/contacts', requireAuth, (req, res) => {
  * Sends email alert + auto-reply
  */
 app.post('/api/contacts', async (req, res) => {
-  const contact = {
-    id     : uid(),
-    name   : sanitise(req.body.name || req.body.first_name || '', 120),
-    email  : sanitise(req.body.email || '', 200),
-    phone  : sanitise(req.body.phone || '', 30),
-    type   : sanitise(req.body.enquiry_type || req.body.type || 'general', 40),
-    message: sanitise(req.body.message || req.body.notes || '', 3000),
-    source : sanitise(req.body['form-name'] || 'api', 50),
-    status : 'new',
-    date   : new Date().toISOString(),
-  };
-
-  const contacts = readJSON(FILES.contacts);
-  contacts.unshift(contact);
-  writeJSON(FILES.contacts, contacts);
+  try {
+    const contact = new Contact({
+      id     : uid(),
+      name   : sanitise(req.body.name || req.body.first_name || '', 120),
+      email  : sanitise(req.body.email || '', 200),
+      phone  : sanitise(req.body.phone || '', 30),
+      type   : sanitise(req.body.enquiry_type || req.body.type || 'general', 40),
+      message: sanitise(req.body.message || req.body.notes || '', 3000),
+      source : sanitise(req.body['form-name'] || 'api', 50),
+      status : 'new',
+    });
+    await contact.save();
 
   // Fire emails (non-blocking)
   Promise.allSettled([
@@ -935,96 +1009,92 @@ app.post('/api/contacts', async (req, res) => {
   });
 
   res.status(201).json({ success: true, id: contact.id });
+  } catch(e) { res.status(500).json({ error: 'Failed to save enquiry' }); }
 });
 
 /** PUT /api/contacts/:id — mark read / update status */
-app.put('/api/contacts/:id', requireAuth, (req, res) => {
-  const contacts = readJSON(FILES.contacts);
-  const idx = contacts.findIndex(c => c.id === req.params.id);
-  if (idx === -1) return res.status(404).json({ error: 'Contact not found.' });
-  contacts[idx] = { ...contacts[idx], ...req.body, id: contacts[idx].id };
-  writeJSON(FILES.contacts, contacts);
-  res.json(contacts[idx]);
+app.put('/api/contacts/:id', requireAuth, async (req, res) => {
+  try {
+    const contact = await Contact.findOneAndUpdate({ id: req.params.id }, req.body, { new: true });
+    if (!contact) return res.status(404).json({ error: 'Enquiry not found.' });
+    res.json(contact);
+  } catch(e) { res.status(500).json({ error: 'Failed to update enquiry' }); }
 });
 
 /** DELETE /api/contacts/:id — super admin only */
-app.delete('/api/contacts/:id', requireSuperAdmin, (req, res) => {
-  const contacts = readJSON(FILES.contacts);
-  const filtered = contacts.filter(c => c.id !== req.params.id);
-  if (filtered.length === contacts.length) return res.status(404).json({ error: 'Contact not found.' });
-  writeJSON(FILES.contacts, filtered);
-  res.json({ success: true });
+app.delete('/api/contacts/:id', requireSuperAdmin, async (req, res) => {
+  try {
+    const result = await Contact.deleteOne({ id: req.params.id });
+    if (result.deletedCount === 0) return res.status(404).json({ error: 'Enquiry not found.' });
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: 'Failed to delete enquiry' }); }
 });
 
 // ─────────────────────────────────────────────
 // ROUTES — CANDIDATE APPLICATIONS
 // ─────────────────────────────────────────────
 
-/**
- * POST /api/applications — public
- * Accepts optional cvBase64 and uploads to Cloudinary
- */
-app.post('/api/applications', async (req, res) => {
-  let cvUrl = req.body.cvUrl || null;  // accept direct URL first
-
-  // If base64 provided, try Cloudinary upload (overwrites direct URL if successful)
-  if (req.body.cvBase64) {
-    console.log('[CV Upload] cvBase64 received, length:', req.body.cvBase64.length, 'chars, starts with:', req.body.cvBase64.substring(0, 20));
-    console.log('[CV Upload] Cloudinary config — cloud:', CFG.CLOUDINARY_CLOUD ? 'SET' : 'EMPTY', 'key:', CFG.CLOUDINARY_KEY ? 'SET' : 'EMPTY', 'secret:', CFG.CLOUDINARY_SECRET ? 'SET' : 'EMPTY');
-    try {
-      const up = await cloudinaryUpload(req.body.cvBase64, 'covenantcrest/cvs', `cv-${uid()}`);
-      cvUrl = up.url;
-      console.log('[CV Upload] SUCCESS — Cloudinary URL:', cvUrl);
-    } catch (e) {
-      console.error('[CV Upload] FAILED:', e.message);
-      // cvUrl stays as whatever was passed directly, or null
-    }
-  } else {
-    console.log('[CV Upload] No cvBase64 in request body. Keys received:', Object.keys(req.body).join(', '));
-  }
-
-  const entry = {
-    id          : uid(),
-    first_name  : sanitise(req.body.first_name   || '', 60),
-    last_name   : sanitise(req.body.last_name    || '', 60),
-    email       : sanitise(req.body.email        || '', 200),
-    phone       : sanitise(req.body.phone        || '', 30),
-    sector      : sanitise(req.body.sector       || '', 40),
-    job_id      : sanitise(req.body.job_id       || '', 30),
-    job_title   : sanitise(req.body.job_title    || '', 120),
-    availability: sanitise(req.body.availability || '', 50),
-    notes       : sanitise(req.body.notes        || '', 2000),
-    cvUrl,
-    status      : 'new',
-    date        : new Date().toISOString(),
-  };
-
-  const apps = readJSON(FILES.apps);
-  apps.unshift(entry);
-  writeJSON(FILES.apps, apps);
-
-  // Email alert to admin + auto-reply confirmation to candidate
-  Promise.allSettled([
-    sendEmail(emailTpl.newApplicationAlert(entry)),
-    entry.email ? sendEmail({ ...emailTpl.applicationAutoReply(entry), to: entry.email }) : Promise.resolve(),
-  ]).catch(e => console.error('Application email error:', e.message));
-
-  res.status(201).json({ success: true, id: entry.id });
+/** GET /api/applications/all — protected */
+app.get('/api/applications/all', requireAuth, async (req, res) => {
+  try {
+    const apps = await Application.find().sort({ createdAt: -1 });
+    res.json(apps);
+  } catch(e) { res.status(500).json({ error: 'Failed to fetch applications' }); }
 });
 
-/** GET /api/applications — protected */
-app.get('/api/applications', requireAuth, (req, res) => {
-  res.json(readJSON(FILES.apps));
+/** GET /api/applications — Super Admin alias */
+app.get('/api/applications', requireSuperAdmin, async (req, res) => {
+  try {
+    const apps = await Application.find().sort({ createdAt: -1 });
+    res.json(apps);
+  } catch(e) { res.status(500).json({ error: 'Failed to fetch applications' }); }
+});
+
+/** POST /api/applications — public */
+app.post('/api/applications', async (req, res) => {
+  try {
+    const { cvBase64, ...rest } = req.body;
+    const entry = new Application({
+      id: uid(),
+      ...rest,
+      status: 'new'
+    });
+
+    if (cvBase64) {
+      try {
+        const up = await cloudinaryUpload(cvBase64, 'covenantcrest/cvs', `cv-${entry.id}`, 'raw');
+        entry.cvUrl = up.url;
+      } catch (e) { console.error('CV upload failed:', e.message); }
+    }
+
+    await entry.save();
+    
+    // Non-blocking emails
+    Promise.allSettled([
+      sendEmail(emailTpl.newApplicationAlert(entry)),
+      entry.email ? sendEmail(emailTpl.applicationAutoReply(entry)) : Promise.resolve(),
+    ]);
+
+    res.status(201).json(entry);
+  } catch(e) { res.status(500).json({ error: 'Failed to save application' }); }
 });
 
 /** PUT /api/applications/:id — update status */
-app.put('/api/applications/:id', requireAuth, (req, res) => {
-  const apps = readJSON(FILES.apps);
-  const idx  = apps.findIndex(a => a.id === req.params.id);
-  if (idx === -1) return res.status(404).json({ error: 'Application not found.' });
-  apps[idx] = { ...apps[idx], ...req.body, id: apps[idx].id, updatedAt: new Date().toISOString() };
-  writeJSON(FILES.apps, apps);
-  res.json(apps[idx]);
+app.put('/api/applications/:id', requireAuth, async (req, res) => {
+  try {
+    const app = await Application.findOneAndUpdate({ id: req.params.id }, req.body, { new: true });
+    if (!app) return res.status(404).json({ error: 'Application not found.' });
+    res.json(app);
+  } catch(e) { res.status(500).json({ error: 'Failed to update application' }); }
+});
+
+/** DELETE /api/applications/:id */
+app.delete('/api/applications/:id', requireAuth, async (req, res) => {
+  try {
+    const result = await Application.deleteOne({ id: req.params.id });
+    if (result.deletedCount === 0) return res.status(404).json({ error: 'Application not found.' });
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: 'Failed to delete application' }); }
 });
 
 // ─────────────────────────────────────────────
