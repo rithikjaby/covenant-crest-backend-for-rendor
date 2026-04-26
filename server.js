@@ -1053,7 +1053,7 @@ app.get('/api/applications', requireSuperAdmin, async (req, res) => {
 /** POST /api/applications — public */
 app.post('/api/applications', async (req, res) => {
   try {
-    const { cvBase64, ...rest } = req.body;
+    const { cvBase64, cvFileName, ...rest } = req.body;
     const entry = new Application({
       id: uid(),
       ...rest,
@@ -1062,7 +1062,13 @@ app.post('/api/applications', async (req, res) => {
 
     if (cvBase64) {
       try {
-        const up = await cloudinaryUpload(cvBase64, 'covenantcrest/cvs', `cv-${entry.id}`, 'raw');
+        let publicId = `cv-${entry.id}`;
+        // Preserve extension if provided to prevent "corrupted" downloads
+        if (cvFileName && cvFileName.includes('.')) {
+          const ext = cvFileName.split('.').pop();
+          if (ext) publicId += `.${ext}`;
+        }
+        const up = await cloudinaryUpload(cvBase64, 'covenantcrest/cvs', publicId, 'raw');
         entry.cvUrl = up.url;
       } catch (e) { console.error('CV upload failed:', e.message); }
     }
