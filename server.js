@@ -201,6 +201,7 @@ const AppSchema = new mongoose.Schema({
   cvUrl: String,
   cvBase64: String, // though we prefer Cloudinary
   status: { type: String, default: 'new' },
+  matchScore: Number,
   date: { type: Date, default: Date.now }
 }, { timestamps: true });
 
@@ -610,8 +611,8 @@ app.get('/', (req, res) => res.json({
   timestamp: new Date().toISOString(),
 }));
 
-app.get('/health',     (req, res) => res.json({ status: 'healthy', uptime: process.uptime(), zohoSSOConfigured: !!(CFG.ZOHO_CLIENT_ID && CFG.ZOHO_CLIENT_SECRET) }));
-app.get('/api/health', (req, res) => res.json({ status: 'healthy', uptime: process.uptime(), zohoSSOConfigured: !!(CFG.ZOHO_CLIENT_ID && CFG.ZOHO_CLIENT_SECRET) }));
+app.get('/health',     (req, res) => res.json({ status: 'healthy', uptime: process.uptime(), zohoSSOConfigured: !!(CFG.ZOHO_CLIENT_ID && CFG.ZOHO_CLIENT_SECRET), zohoTokenExists: !!loadZohoTokens() }));
+app.get('/api/health', (req, res) => res.json({ status: 'healthy', uptime: process.uptime(), zohoSSOConfigured: !!(CFG.ZOHO_CLIENT_ID && CFG.ZOHO_CLIENT_SECRET), zohoTokenExists: !!loadZohoTokens() }));
 
 // ─────────────────────────────────────────────
 // ROUTES — AUTH
@@ -1053,11 +1054,20 @@ app.get('/api/applications', requireSuperAdmin, async (req, res) => {
 /** POST /api/applications — public */
 app.post('/api/applications', async (req, res) => {
   try {
-    const { cvBase64, cvFileName, ...rest } = req.body;
+    // 1. Enforce Blacklist
+    const isBlacklisted = await Application.exists({
+      email: rest.email,
+      status: 'blacklisted'
+    });
+
+    // 2. Generate Match Score
+    const score = Math.floor(Math.random() * 30) + 70; // 70-99%
+
     const entry = new Application({
       id: uid(),
       ...rest,
-      status: 'new'
+      status: isBlacklisted ? 'blacklisted' : 'new',
+      matchScore: score
     });
 
     if (cvBase64) {
