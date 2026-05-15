@@ -202,6 +202,19 @@ const AppSchema = new mongoose.Schema({
   cvBase64: String, // though we prefer Cloudinary
   status: { type: String, default: 'new' },
   matchScore: Number,
+  // Compliance fields
+  dbs_level: String,
+  dbs_issue_date: String,
+  dbs_expiry_date: String,
+  dbs_cert_number: String,
+  sia_licence_number: String,
+  sia_expiry_date: String,
+  rtw_doc_type: String,
+  rtw_expiry_date: String,
+  rtw_verified: { type: Boolean, default: false },
+  manual_handling_cert: String,
+  compliance_notes: String,
+  compliance_status: { type: String, default: 'incomplete' },
   date: { type: Date, default: Date.now }
 }, { timestamps: true });
 
@@ -1054,6 +1067,8 @@ app.get('/api/applications', requireSuperAdmin, async (req, res) => {
 /** POST /api/applications — public */
 app.post('/api/applications', async (req, res) => {
   try {
+    const { cvBase64, cvFileName, ...rest } = req.body;
+
     // 1. Enforce Blacklist
     const isBlacklisted = await Application.exists({
       email: rest.email,
@@ -1088,7 +1103,7 @@ app.post('/api/applications', async (req, res) => {
     // Non-blocking emails
     Promise.allSettled([
       sendEmail(emailTpl.newApplicationAlert(entry)),
-      entry.email ? sendEmail(emailTpl.applicationAutoReply(entry)) : Promise.resolve(),
+      entry.email ? sendEmail({ ...emailTpl.applicationAutoReply(entry), to: entry.email }) : Promise.resolve(),
     ]);
 
     res.status(201).json(entry);
@@ -1111,6 +1126,28 @@ app.delete('/api/applications/:id', requireAuth, async (req, res) => {
     if (result.deletedCount === 0) return res.status(404).json({ error: 'Application not found.' });
     res.json({ success: true });
   } catch(e) { res.status(500).json({ error: 'Failed to delete application' }); }
+});
+
+/** GET /api/compliance/expiring — hired workers with docs expiring within 90 days (auth) */
+app.get('/api/compliance/expiring', requireAuth, async (req, res) => {
+  try {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const limit = new Date(today.getTime() + 90 * 24 * 60 * 60 * 1000);
+    const limitStr = limit.toISOString().slice(0, 10);
+
+    const workers = await Application.find({
+      status: 'hired',
+      $or: [
+        { dbs_expiry_date:      { $exists: true, $ne: '', $lte: limitStr } },
+        { sia_expiry_date:      { $exists: true, $ne: '', $lte: limitStr } },
+        { rtw_expiry_date:      { $exists: true, $ne: '', $lte: limitStr } },
+        { manual_handling_cert: { $exists: true, $ne: '', $lte: limitStr } },
+      ],
+    }).sort({ createdAt: -1 });
+
+    res.json(workers);
+  } catch(e) { res.status(500).json({ error: 'Failed to fetch compliance data' }); }
 });
 
 // ─────────────────────────────────────────────
@@ -1237,7 +1274,7 @@ app.post('/api/netlify-webhook', async (req, res) => {
     // Alert to admin + confirmation to candidate
     Promise.allSettled([
       sendEmail(emailTpl.newApplicationAlert(entry)),
-      entry.email ? sendEmail(emailTpl.applicationAutoReply(entry)) : Promise.resolve(),
+      entry.email ? sendEmail({ ...emailTpl.applicationAutoReply(entry), to: entry.email }) : Promise.resolve(),
     ]);
 
     return res.json({ received: true, id: entry.id, routed: 'applications' });
