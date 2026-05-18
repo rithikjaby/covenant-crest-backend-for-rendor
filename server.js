@@ -90,7 +90,7 @@ const PORT = process.env.PORT || 3001;
 const CFG = {
   SUPER_ADMIN_EMAIL : process.env.SUPER_ADMIN_EMAIL || 'jaby.k@covenantcrest.co.uk',
   SUPER_ADMIN_PWD   : process.env._SAVED_ADMIN_PW || process.env.SUPER_ADMIN_PWD || 'ChangeMe2025!',
-  JWT_SECRET        : process.env.JWT_SECRET        || ('insecure-dev-' + Math.random()),
+  JWT_SECRET        : process.env.JWT_SECRET        || crypto.randomBytes(32).toString('hex'),
   ALLOWED_ORIGIN    : process.env.ALLOWED_ORIGIN    || 'https://covenantcrest.co.uk',
 
   // Email (Resend)
@@ -107,8 +107,7 @@ const CFG = {
   NETLIFY_SECRET    : process.env.NETLIFY_WEBHOOK_SECRET || '',
 
   // Zoho OAuth (https://api-console.zoho.com — create a "Server-based Application")
-  // Used so the admin panel can send emails directly via your Zoho mailbox
-  // without sharing your password. Tokens auto-refresh — set-and-forget.
+  // Set ZOHO_REGION=com for US/global accounts, leave unset for EU accounts (default)
   ZOHO_CLIENT_ID     : process.env.ZOHO_CLIENT_ID     || '',
   ZOHO_CLIENT_SECRET : process.env.ZOHO_CLIENT_SECRET || '',
   ZOHO_REDIRECT_URI  : process.env.ZOHO_REDIRECT_URI  || 'https://covenantcrest.co.uk/api/zoho/callback',
@@ -116,6 +115,8 @@ const CFG = {
   ZOHO_REFRESH_TOKEN : process.env.ZOHO_REFRESH_TOKEN || '',   // set after first authorisation
   ZOHO_FROM_EMAIL    : process.env.ZOHO_FROM_EMAIL    || 'jaby.k@covenantcrest.co.uk',
   ZOHO_FROM_NAME     : process.env.ZOHO_FROM_NAME     || 'Covenant Crest Group',
+  ZOHO_ACCOUNTS_HOST : process.env.ZOHO_REGION === 'com' ? 'accounts.zoho.com' : 'accounts.zoho.eu',
+  ZOHO_MAIL_HOST     : process.env.ZOHO_REGION === 'com' ? 'mail.zoho.com'     : 'mail.zoho.eu',
 
   // Database
   MONGODB_URI        : process.env.MONGODB_URI        || '',
@@ -182,6 +183,9 @@ const ContactSchema = new mongoose.Schema({
   type: String,
   message: String,
   source: String,
+  notes: String,
+  adminNotes: String,
+  status: { type: String, default: 'new' },
   read: { type: Boolean, default: false },
   date: { type: Date, default: Date.now }
 }, { timestamps: true });
@@ -215,6 +219,8 @@ const AppSchema = new mongoose.Schema({
   manual_handling_cert: String,
   compliance_notes: String,
   compliance_status: { type: String, default: 'incomplete' },
+  source: String,
+  rating: Number,
   date: { type: Date, default: Date.now }
 }, { timestamps: true });
 
@@ -285,9 +291,14 @@ async function hashPassword(pwd) {
 
 async function verifyPassword(pwd, stored) {
   if (!stored) return false;
-  // Fallback for legacy plain-text passwords
+  // Fallback for legacy plain-text passwords — use timing-safe comparison
   if (!stored.startsWith('$2') && !stored.startsWith('pbkdf2$')) {
-    return pwd === stored;
+    try {
+      const a = Buffer.from(pwd);
+      const b = Buffer.from(stored);
+      if (a.length !== b.length) return false;
+      return crypto.timingSafeEqual(a, b);
+    } catch { return false; }
   }
   // Fallback for previous PBKDF2 implementation
   if (stored.startsWith('pbkdf2$')) {
@@ -522,6 +533,14 @@ function cloudinaryUpload(base64Data, folder = 'covenantcrest', publicId = null,
 // ─────────────────────────────────────────────
 const rateLimitStore = new Map();
 
+// Purge expired entries every 10 minutes to prevent unbounded memory growth
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of rateLimitStore) {
+    if (now > entry.resetAt) rateLimitStore.delete(key);
+  }
+}, 10 * 60 * 1000).unref();
+
 function rateLimit(windowMs, max) {
   return (req, res, next) => {
     const key = req.ip + ':' + req.path;
@@ -554,19 +573,25 @@ app.use(helmet({
 
 app.use(cors({
   origin(origin, cb) {
-    const allowed = [
-      CFG.ALLOWED_ORIGIN,
-      'http://localhost:3000',
-      'http://localhost:5500',
-      'http://127.0.0.1:5500',
-    ];
-    if (!origin || allowed.includes(origin)) return cb(null, true);
-    cb(new Error('Not allowed by CORS: ' + origin));
+    if (!origin) return cb(null, true);
+    const base = (CFG.ALLOWED_ORIGIN || '').replace(/^https?:\/\//, '');
+    if (
+      origin === CFG.ALLOWED_ORIGIN ||
+      origin === 'https://www.' + base ||
+      origin === 'http://www.'  + base ||
+      origin === 'http://localhost:3000' ||
+      origin === 'http://localhost:5500' ||
+      origin === 'http://127.0.0.1:5500'
+    ) return cb(null, true);
+    cb(null, false);
   },
   credentials: true,
 }));
 
-app.use(express.json({ limit: '5mb' }));   // 5 MB to allow base64 image uploads
+app.use(express.json({
+  limit: '5mb',
+  verify: (req, _res, buf) => { req.rawBody = buf; },
+}));
 app.use(express.urlencoded({ extended: true, limit: '5mb' }));
 
 // ─────────────────────────────────────────────
@@ -587,6 +612,41 @@ function requireSuperAdmin(req, res, next) {
       return res.status(403).json({ error: 'Forbidden. Super Admin access required.' });
     }
     next();
+  });
+}
+
+// ─────────────────────────────────────────────
+// CLOUDINARY DELETE HELPER
+// ─────────────────────────────────────────────
+function cloudinaryDelete(imageUrl) {
+  if (!imageUrl || !CFG.CLOUDINARY_CLOUD || !CFG.CLOUDINARY_KEY || !CFG.CLOUDINARY_SECRET) return Promise.resolve();
+  // Extract public_id from URL: strip version, leading slash, and extension
+  // e.g. https://res.cloudinary.com/cloud/image/upload/v123/folder/name.jpg → folder/name
+  const match = imageUrl.match(/\/upload\/(?:v\d+\/)?(.+?)(\.[^.]+)?$/);
+  if (!match) return Promise.resolve();
+  const publicId = match[1];
+  const resourceType = imageUrl.includes('/raw/') ? 'raw' : 'image';
+
+  const timestamp = Math.floor(Date.now() / 1000);
+  const sigStr    = `public_id=${publicId}&timestamp=${timestamp}` + CFG.CLOUDINARY_SECRET;
+  const signature = crypto.createHash('sha1').update(sigStr).digest('hex');
+
+  const body = new URLSearchParams({ public_id: publicId, api_key: CFG.CLOUDINARY_KEY, timestamp, signature }).toString();
+  const bodyBuf = Buffer.from(body);
+
+  return new Promise((resolve) => {
+    const req = https.request({
+      hostname: 'api.cloudinary.com',
+      path    : `/v1_1/${CFG.CLOUDINARY_CLOUD}/${resourceType}/destroy`,
+      method  : 'POST',
+      headers : { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': bodyBuf.length },
+    }, (res) => {
+      res.resume();
+      resolve();
+    });
+    req.on('error', () => resolve());
+    req.write(bodyBuf);
+    req.end();
   });
 }
 
@@ -776,7 +836,7 @@ app.get('/api/auth/zoho-login', (req, res) => {
     access_type  : 'offline',
     prompt       : 'consent',
   });
-  res.redirect('https://accounts.zoho.eu/oauth/v2/auth?' + params.toString());
+  res.redirect(`https://${CFG.ZOHO_ACCOUNTS_HOST}/oauth/v2/auth?` + params.toString());
 });
 
 /**
@@ -817,10 +877,11 @@ app.get('/api/auth/zoho-callback', async (req, res) => {
 
     let tokenData;
     try {
-      tokenData = await exchangeToken('accounts.zoho.eu');
-      if (!tokenData.access_token) throw new Error('EU failed');
+      tokenData = await exchangeToken(CFG.ZOHO_ACCOUNTS_HOST);
+      if (!tokenData.access_token) throw new Error('Primary region failed');
     } catch(e) {
-      tokenData = await exchangeToken('accounts.zoho.com');
+      const fallback = CFG.ZOHO_ACCOUNTS_HOST === 'accounts.zoho.eu' ? 'accounts.zoho.com' : 'accounts.zoho.eu';
+      tokenData = await exchangeToken(fallback);
     }
 
     if (!tokenData.access_token) {
@@ -839,7 +900,11 @@ app.get('/api/auth/zoho-callback', async (req, res) => {
         let d = '';
         r.on('data', c => d += c);
         r.on('end', () => {
-          try { resolve(JSON.parse(d)); } catch(e) { reject(e); }
+          try {
+            const json = JSON.parse(d);
+            if (json.error || r.statusCode >= 400) throw new Error(json.error || 'HTTP ' + r.statusCode);
+            resolve(json);
+          } catch(e) { reject(e); }
         });
       });
       req3.on('error', reject);
@@ -848,9 +913,10 @@ app.get('/api/auth/zoho-callback', async (req, res) => {
 
     let userInfo;
     try {
-      userInfo = await getUserInfo('accounts.zoho.eu');
+      userInfo = await getUserInfo(CFG.ZOHO_ACCOUNTS_HOST);
     } catch(e) {
-      userInfo = await getUserInfo('accounts.zoho.com');
+      const fallback = CFG.ZOHO_ACCOUNTS_HOST === 'accounts.zoho.eu' ? 'accounts.zoho.com' : 'accounts.zoho.eu';
+      userInfo = await getUserInfo(fallback);
     }
 
     // Also try getting email from id_token if not in userInfo
@@ -972,8 +1038,11 @@ app.put('/api/jobs/:id', requireAuth, async (req, res) => {
 /** DELETE /api/jobs/:id */
 app.delete('/api/jobs/:id', requireAuth, async (req, res) => {
   try {
-    const result = await Job.deleteOne({ id: req.params.id });
-    if (result.deletedCount === 0) return res.status(404).json({ error: 'Job not found.' });
+    const job = await Job.findOne({ id: req.params.id });
+    if (!job) return res.status(404).json({ error: 'Job not found.' });
+    await Job.deleteOne({ id: req.params.id });
+    // Clean up associated Cloudinary image (non-blocking, errors silently ignored)
+    if (job.imageUrl) cloudinaryDelete(job.imageUrl).catch(() => {});
     res.json({ success: true });
   } catch(e) { res.status(500).json({ error: 'Failed to delete job' }); }
 });
@@ -1029,7 +1098,13 @@ app.post('/api/contacts', async (req, res) => {
 /** PUT /api/contacts/:id — mark read / update status */
 app.put('/api/contacts/:id', requireAuth, async (req, res) => {
   try {
-    const contact = await Contact.findOneAndUpdate({ id: req.params.id }, req.body, { new: true });
+    const { status, read, notes, adminNotes } = req.body;
+    const update = {};
+    if (status     !== undefined) update.status     = sanitise(String(status), 40);
+    if (read       !== undefined) update.read       = !!read;
+    if (notes      !== undefined) update.notes      = sanitise(String(notes), 3000);
+    if (adminNotes !== undefined) update.adminNotes = sanitise(String(adminNotes), 3000);
+    const contact = await Contact.findOneAndUpdate({ id: req.params.id }, update, { new: true });
     if (!contact) return res.status(404).json({ error: 'Enquiry not found.' });
     res.json(contact);
   } catch(e) { res.status(500).json({ error: 'Failed to update enquiry' }); }
@@ -1075,14 +1150,10 @@ app.post('/api/applications', async (req, res) => {
       status: 'blacklisted'
     });
 
-    // 2. Generate Match Score
-    const score = Math.floor(Math.random() * 30) + 70; // 70-99%
-
     const entry = new Application({
       id: uid(),
       ...rest,
       status: isBlacklisted ? 'blacklisted' : 'new',
-      matchScore: score
     });
 
     if (cvBase64) {
@@ -1113,7 +1184,19 @@ app.post('/api/applications', async (req, res) => {
 /** PUT /api/applications/:id — update status */
 app.put('/api/applications/:id', requireAuth, async (req, res) => {
   try {
-    const app = await Application.findOneAndUpdate({ id: req.params.id }, req.body, { new: true });
+    const allowed = [
+      'status', 'notes', 'adminNotes', 'matchScore', 'rating',
+      'dbs_expiry_date', 'sia_expiry_date', 'rtw_expiry_date', 'manual_handling_cert',
+    ];
+    const update = {};
+    for (const key of allowed) {
+      if (req.body[key] !== undefined) {
+        update[key] = typeof req.body[key] === 'string'
+          ? sanitise(req.body[key], 500)
+          : req.body[key];
+      }
+    }
+    const app = await Application.findOneAndUpdate({ id: req.params.id }, update, { new: true });
     if (!app) return res.status(404).json({ error: 'Application not found.' });
     res.json(app);
   } catch(e) { res.status(500).json({ error: 'Failed to update application' }); }
@@ -1235,23 +1318,24 @@ app.delete('/api/users/:id', requireSuperAdmin, (req, res) => {
  * Optional: set webhook secret in Netlify and match NETLIFY_WEBHOOK_SECRET env var
  */
 app.post('/api/netlify-webhook', async (req, res) => {
-  // Verify signature if secret is configured
+  // Verify signature if secret is configured — use raw body to match Netlify's HMAC
   if (CFG.NETLIFY_SECRET) {
-    const sig  = req.headers['x-webhook-signature'] || '';
-    const body = JSON.stringify(req.body);
-    const expected = crypto.createHmac('sha256', CFG.NETLIFY_SECRET).update(body).digest('hex');
+    const sig      = req.headers['x-webhook-signature'] || '';
+    const rawBody  = req.rawBody || Buffer.from(JSON.stringify(req.body));
+    const expected = crypto.createHmac('sha256', CFG.NETLIFY_SECRET).update(rawBody).digest('hex');
     if (sig !== `sha256=${expected}`) {
       return res.status(401).json({ error: 'Invalid webhook signature.' });
     }
   }
 
+  try {
   const payload = req.body;
   const data    = payload.data || payload;
   const formName = sanitise(payload.form_name || data.form_name || '', 80);
 
   // ── Route candidate-apply to Applications ────────────────────
   if (formName === 'candidate-apply') {
-    const entry = {
+    const entry = new Application({
       id          : uid(),
       first_name  : sanitise(data.first_name || data.name?.split(' ')[0] || '', 60),
       last_name   : sanitise(data.last_name  || data.name?.split(' ').slice(1).join(' ') || '', 60),
@@ -1265,11 +1349,8 @@ app.post('/api/netlify-webhook', async (req, res) => {
       cvUrl       : null,
       status      : 'new',
       source      : 'netlify-form',
-      date        : new Date().toISOString(),
-    };
-    const apps = readJSON(FILES.apps);
-    apps.unshift(entry);
-    writeJSON(FILES.apps, apps);
+    });
+    await entry.save();
 
     // Alert to admin + confirmation to candidate
     Promise.allSettled([
@@ -1281,7 +1362,7 @@ app.post('/api/netlify-webhook', async (req, res) => {
   }
 
   // ── All other forms → Contact Enquiries ──────────────────────
-  const contact = {
+  const contact = new Contact({
     id     : uid(),
     name   : sanitise(data.name || data.first_name || '', 120),
     email  : sanitise(data.email || '', 200),
@@ -1290,12 +1371,8 @@ app.post('/api/netlify-webhook', async (req, res) => {
     message: sanitise(data.message || data.notes || '', 3000),
     source : sanitise(formName || 'netlify-webhook', 50),
     status : 'new',
-    date   : new Date().toISOString(),
-  };
-
-  const contacts = readJSON(FILES.contacts);
-  contacts.unshift(contact);
-  writeJSON(FILES.contacts, contacts);
+  });
+  await contact.save();
 
   Promise.allSettled([
     sendEmail(emailTpl.newEnquiryAlert(contact)),
@@ -1303,6 +1380,10 @@ app.post('/api/netlify-webhook', async (req, res) => {
   ]);
 
   res.json({ received: true, id: contact.id, routed: 'contacts' });
+  } catch(e) {
+    console.error('Webhook handler error:', e.message);
+    return res.status(500).json({ error: 'Webhook processing failed.' });
+  }
 });
 
 // ─────────────────────────────────────────────
@@ -1379,7 +1460,7 @@ async function getZohoAccessToken() {
 
   return new Promise((resolve, reject) => {
     const req = https.request({
-      hostname: 'accounts.zoho.eu',   // use zoho.com if your account is US-based
+      hostname: CFG.ZOHO_ACCOUNTS_HOST,
       path    : '/oauth/v2/token',
       method  : 'POST',
       headers : {
@@ -1426,7 +1507,7 @@ async function sendEmailViaZoho({ to, subject, html }) {
 
   return new Promise((resolve, reject) => {
     const req = https.request({
-      hostname: 'mail.zoho.eu',     // use mail.zoho.com if US account
+      hostname: CFG.ZOHO_MAIL_HOST,
       path    : '/api/accounts/me/messages',
       method  : 'POST',
       headers : {
@@ -1519,7 +1600,7 @@ app.get('/api/zoho/authorise', requireSuperAdmin, (req, res) => {
     access_type  : 'offline',
     prompt       : 'consent',
   });
-  res.redirect(`https://accounts.zoho.eu/oauth/v2/auth?${params.toString()}`);
+  res.redirect(`https://${CFG.ZOHO_ACCOUNTS_HOST}/oauth/v2/auth?${params.toString()}`);
 });
 
 /**
@@ -1547,7 +1628,7 @@ app.get('/api/zoho/callback', async (req, res) => {
   try {
     const tokens = await new Promise((resolve, reject) => {
       const req2 = https.request({
-        hostname: 'accounts.zoho.eu',
+        hostname: CFG.ZOHO_ACCOUNTS_HOST,
         path    : '/oauth/v2/token',
         method  : 'POST',
         headers : {
