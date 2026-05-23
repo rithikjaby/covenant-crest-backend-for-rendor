@@ -106,17 +106,14 @@ const CFG = {
   // Netlify webhook secret (optional)
   NETLIFY_SECRET    : process.env.NETLIFY_WEBHOOK_SECRET || '',
 
-  // Zoho OAuth (https://api-console.zoho.com — create a "Server-based Application")
-  // Set ZOHO_REGION=com for US/global accounts, leave unset for EU accounts (default)
-  ZOHO_CLIENT_ID     : process.env.ZOHO_CLIENT_ID     || '',
-  ZOHO_CLIENT_SECRET : process.env.ZOHO_CLIENT_SECRET || '',
-  ZOHO_REDIRECT_URI  : process.env.ZOHO_REDIRECT_URI  || 'https://covenantcrest.co.uk/api/zoho/callback',
-  ZOHO_SSO_REDIRECT_URI: process.env.ZOHO_SSO_REDIRECT_URI || 'https://www.covenantcrest.co.uk/api/auth/zoho-callback',
-  ZOHO_REFRESH_TOKEN : process.env.ZOHO_REFRESH_TOKEN || '',   // set after first authorisation
-  ZOHO_FROM_EMAIL    : process.env.ZOHO_FROM_EMAIL    || 'jaby.k@covenantcrest.co.uk',
-  ZOHO_FROM_NAME     : process.env.ZOHO_FROM_NAME     || 'Covenant Crest Group',
-  ZOHO_ACCOUNTS_HOST : process.env.ZOHO_REGION === 'com' ? 'accounts.zoho.com' : 'accounts.zoho.eu',
-  ZOHO_MAIL_HOST     : process.env.ZOHO_REGION === 'com' ? 'mail.zoho.com'     : 'mail.zoho.eu',
+  // HubSpot CRM (https://app.hubspot.com -> Private App Access Token)
+  HUBSPOT_ACCESS_TOKEN: process.env.HUBSPOT_ACCESS_TOKEN || '',
+
+  // Microsoft SSO (Azure AD OAuth 2.0)
+  MICROSOFT_CLIENT_ID    : process.env.MICROSOFT_CLIENT_ID || '',
+  MICROSOFT_CLIENT_SECRET: process.env.MICROSOFT_CLIENT_SECRET || '',
+  MICROSOFT_REDIRECT_URI : process.env.MICROSOFT_REDIRECT_URI || 'https://covenantcrest.co.uk/api/auth/microsoft-callback',
+  MICROSOFT_TENANT_ID    : process.env.MICROSOFT_TENANT_ID || 'common',
 
   // Database
   MONGODB_URI        : process.env.MONGODB_URI        || '',
@@ -684,8 +681,8 @@ app.get('/', (req, res) => res.json({
   timestamp: new Date().toISOString(),
 }));
 
-app.get('/health',     (req, res) => res.json({ status: 'healthy', uptime: process.uptime(), zohoSSOConfigured: !!(CFG.ZOHO_CLIENT_ID && CFG.ZOHO_CLIENT_SECRET), zohoTokenExists: !!loadZohoTokens() }));
-app.get('/api/health', (req, res) => res.json({ status: 'healthy', uptime: process.uptime(), zohoSSOConfigured: !!(CFG.ZOHO_CLIENT_ID && CFG.ZOHO_CLIENT_SECRET), zohoTokenExists: !!loadZohoTokens() }));
+app.get('/health',     (req, res) => res.json({ status: 'healthy', uptime: process.uptime(), databaseConnected: mongoose.connection.readyState === 1, resendConfigured: !!CFG.RESEND_API_KEY, hubspotConfigured: !!CFG.HUBSPOT_ACCESS_TOKEN, microsoftSSOConfigured: !!(CFG.MICROSOFT_CLIENT_ID && CFG.MICROSOFT_CLIENT_SECRET) }));
+app.get('/api/health', (req, res) => res.json({ status: 'healthy', uptime: process.uptime(), databaseConnected: mongoose.connection.readyState === 1, resendConfigured: !!CFG.RESEND_API_KEY, hubspotConfigured: !!CFG.HUBSPOT_ACCESS_TOKEN, microsoftSSOConfigured: !!(CFG.MICROSOFT_CLIENT_ID && CFG.MICROSOFT_CLIENT_SECRET) }));
 
 // ─────────────────────────────────────────────
 // ROUTES — AUTH
@@ -817,93 +814,95 @@ app.get('/api/security-logs', requireSuperAdmin, (req, res) => {
 });
 
 // ─────────────────────────────────────────────
-// ZOHO SSO LOGIN — admin login via Zoho account
+// MICROSOFT SSO LOGIN — admin login via Outlook/Microsoft account
 // ─────────────────────────────────────────────
 
 /**
- * GET /api/auth/zoho-login
- * Redirects browser to Zoho OAuth consent screen for SSO login
+ * GET /api/auth/microsoft-login
+ * Redirects browser to Microsoft OAuth 2.0 consent screen for SSO
  */
-app.get('/api/auth/zoho-login', (req, res) => {
-  if (!CFG.ZOHO_CLIENT_ID) {
-    return res.status(503).send('Zoho SSO not configured. Set ZOHO_CLIENT_ID in environment variables.');
+app.get('/api/auth/microsoft-login', (req, res) => {
+  if (!CFG.MICROSOFT_CLIENT_ID) {
+    return res.status(503).send('Microsoft SSO not configured. Set MICROSOFT_CLIENT_ID in environment variables.');
   }
   const params = new URLSearchParams({
+    client_id    : CFG.MICROSOFT_CLIENT_ID,
     response_type: 'code',
-    client_id    : CFG.ZOHO_CLIENT_ID,
-    scope        : 'openid,profile,email,ZohoMail.accounts.READ',
-    redirect_uri : CFG.ZOHO_SSO_REDIRECT_URI || (CFG.ALLOWED_ORIGIN + '/api/auth/zoho-callback'),
-    access_type  : 'offline',
-    prompt       : 'consent',
+    redirect_uri : CFG.MICROSOFT_REDIRECT_URI,
+    response_mode: 'query',
+    scope        : 'openid profile email User.Read',
+    state        : crypto.randomBytes(16).toString('hex')
   });
-  res.redirect(`https://${CFG.ZOHO_ACCOUNTS_HOST}/oauth/v2/auth?` + params.toString());
+  res.redirect(`https://login.microsoftonline.com/${CFG.MICROSOFT_TENANT_ID}/oauth2/v2.0/authorize?` + params.toString());
 });
 
 /**
- * GET /api/auth/zoho-callback
- * Zoho redirects here after user approves — exchange code for token,
- * verify the email matches SUPER_ADMIN_EMAIL, issue JWT
+ * GET /api/auth/microsoft-callback
+ * Microsoft redirects here with a code — we exchange it for tokens,
+ * query MS Graph for the user's email, verify it, and issue a JWT.
  */
-app.get('/api/auth/zoho-callback', async (req, res) => {
-  const { code, error } = req.query;
+app.get('/api/auth/microsoft-callback', async (req, res) => {
+  const { code, error, error_description } = req.query;
   if (error || !code) {
-    return res.redirect('/login.html?error=zoho_cancelled');
+    console.error('[microsoft-sso] Auth error:', error_description || error);
+    return res.redirect('/login.html?error=microsoft_cancelled');
   }
   try {
-    // Exchange code for access token
-    const tokenBody = new URLSearchParams({
-      grant_type   : 'authorization_code',
-      client_id    : CFG.ZOHO_CLIENT_ID,
-      client_secret: CFG.ZOHO_CLIENT_SECRET,
-      redirect_uri : CFG.ZOHO_SSO_REDIRECT_URI || (CFG.ALLOWED_ORIGIN + '/api/auth/zoho-callback'),
+    const tokenParams = new URLSearchParams({
+      client_id    : CFG.MICROSOFT_CLIENT_ID,
+      scope        : 'openid profile email User.Read',
       code,
+      redirect_uri : CFG.MICROSOFT_REDIRECT_URI,
+      grant_type   : 'authorization_code',
+      client_secret: CFG.MICROSOFT_CLIENT_SECRET
     }).toString();
 
-    const exchangeToken = (hostname) => new Promise((resolve, reject) => {
+    // 1. Exchange authorization code for token
+    const tokenData = await new Promise((resolve, reject) => {
       const req2 = https.request({
-        hostname,
-        path    : '/oauth/v2/token',
+        hostname: 'login.microsoftonline.com',
+        path    : `/${CFG.MICROSOFT_TENANT_ID}/oauth2/v2.0/token`,
         method  : 'POST',
-        headers : { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(tokenBody) },
+        headers : {
+          'Content-Type'  : 'application/x-www-form-urlencoded',
+          'Content-Length': Buffer.byteLength(tokenParams)
+        }
       }, (r) => {
         let d = '';
         r.on('data', c => d += c);
-        r.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { reject(e); } });
+        r.on('end', () => {
+          try {
+            const parsed = JSON.parse(d);
+            if (r.statusCode >= 400) reject(new Error(parsed.error_description || parsed.error || 'HTTP ' + r.statusCode));
+            else resolve(parsed);
+          } catch(e) { reject(e); }
+        });
       });
       req2.on('error', reject);
-      req2.write(tokenBody);
+      req2.write(tokenParams);
       req2.end();
     });
 
-    let tokenData;
-    try {
-      tokenData = await exchangeToken(CFG.ZOHO_ACCOUNTS_HOST);
-      if (!tokenData.access_token) throw new Error('Primary region failed');
-    } catch(e) {
-      const fallback = CFG.ZOHO_ACCOUNTS_HOST === 'accounts.zoho.eu' ? 'accounts.zoho.com' : 'accounts.zoho.eu';
-      tokenData = await exchangeToken(fallback);
-    }
-
     if (!tokenData.access_token) {
-      console.error('[zoho-sso] Token exchange failed:', tokenData);
-      return res.redirect('/login.html?error=zoho_token_failed');
+      console.error('[microsoft-sso] Token response contained no access token');
+      return res.redirect('/login.html?error=microsoft_token_failed');
     }
 
-    // Get user info from Zoho - try EU first, fallback to COM
-    const getUserInfo = (hostname) => new Promise((resolve, reject) => {
+    // 2. Query Microsoft Graph API to fetch profile details
+    const profile = await new Promise((resolve, reject) => {
       const req3 = https.request({
-        hostname,
-        path    : '/oauth/v2/userinfo',
+        hostname: 'graph.microsoft.com',
+        path    : '/v1.0/me',
         method  : 'GET',
-        headers : { 'Authorization': 'Zoho-oauthtoken ' + tokenData.access_token },
+        headers : { 'Authorization': 'Bearer ' + tokenData.access_token }
       }, (r) => {
         let d = '';
         r.on('data', c => d += c);
         r.on('end', () => {
           try {
             const json = JSON.parse(d);
-            if (json.error || r.statusCode >= 400) throw new Error(json.error || 'HTTP ' + r.statusCode);
-            resolve(json);
+            if (r.statusCode >= 400) reject(new Error(json.error?.message || 'Graph API ' + r.statusCode));
+            else resolve(json);
           } catch(e) { reject(e); }
         });
       });
@@ -911,39 +910,22 @@ app.get('/api/auth/zoho-callback', async (req, res) => {
       req3.end();
     });
 
-    let userInfo;
-    try {
-      userInfo = await getUserInfo(CFG.ZOHO_ACCOUNTS_HOST);
-    } catch(e) {
-      const fallback = CFG.ZOHO_ACCOUNTS_HOST === 'accounts.zoho.eu' ? 'accounts.zoho.com' : 'accounts.zoho.eu';
-      userInfo = await getUserInfo(fallback);
-    }
-
-    // Also try getting email from id_token if not in userInfo
-    let zohoEmail = (userInfo.email || userInfo.Email || userInfo.sub || '').toLowerCase();
+    const userEmail = (profile.mail || profile.userPrincipalName || '').toLowerCase();
     
-    // If still no email, decode the id_token
-    if (!zohoEmail && tokenData.id_token) {
-      try {
-        const payload = JSON.parse(Buffer.from(tokenData.id_token.split('.')[1], 'base64').toString());
-        zohoEmail = (payload.email || payload.sub || '').toLowerCase();
-      } catch(e) { /* ignore */ }
+    // 3. Enforce matching email security constraint
+    if (!userEmail || userEmail !== CFG.SUPER_ADMIN_EMAIL.toLowerCase()) {
+      console.warn('[microsoft-sso] Unauthorised Azure AD login attempt:', userEmail);
+      return res.redirect('/login.html?error=microsoft_unauthorised');
     }
 
-    // Check if this Zoho account matches the super admin email
-    if (zohoEmail !== CFG.SUPER_ADMIN_EMAIL.toLowerCase()) {
-      console.warn('[zoho-sso] Unauthorised Zoho login attempt:', zohoEmail);
-      return res.redirect('/login.html?error=zoho_unauthorised');
-    }
-
-    // Issue JWT and redirect to admin
-    const token = makeToken({ email: zohoEmail, role: 'superadmin' });
-    // Pass token via URL fragment (never logged by servers)
+    // 4. Issue JWT token & redirect to Admin Panel via fragment hash
+    const token = makeToken({ email: userEmail, role: 'superadmin' });
+    logSecurityEvent('sso_login', userEmail, req, { provider: 'microsoft' });
     res.redirect('/admin.html#sso=' + token);
 
   } catch (err) {
-    console.error('[zoho-sso] Error:', err.message);
-    res.redirect('/login.html?error=zoho_error');
+    console.error('[microsoft-sso] OAuth Callback processing failed:', err.message);
+    res.redirect('/login.html?error=microsoft_error');
   }
 });
 
@@ -1078,16 +1060,17 @@ app.post('/api/contacts', async (req, res) => {
     });
     await contact.save();
 
-  // Fire emails (non-blocking)
+  // Fire emails + CRM Sync (non-blocking)
   Promise.allSettled([
     sendEmail(emailTpl.newEnquiryAlert(contact)),
     contact.email ? sendEmail({
       ...emailTpl.enquiryAutoReply(contact),
       to: contact.email,
     }) : Promise.resolve(),
+    syncToHubSpot(contact, 'contact').catch(e => console.error('[HubSpot] Contact CRM Sync failed:', e.message))
   ]).then(results => {
     results.forEach((r, i) => {
-      if (r.status === 'rejected') console.error('Email error #' + i, r.reason?.message);
+      if (r.status === 'rejected') console.error('Email/CRM error #' + i, r.reason?.message);
     });
   });
 
@@ -1171,10 +1154,11 @@ app.post('/api/applications', async (req, res) => {
 
     await entry.save();
     
-    // Non-blocking emails
+    // Non-blocking emails + CRM Sync
     Promise.allSettled([
       sendEmail(emailTpl.newApplicationAlert(entry)),
       entry.email ? sendEmail({ ...emailTpl.applicationAutoReply(entry), to: entry.email }) : Promise.resolve(),
+      syncToHubSpot(entry, 'candidate').catch(e => console.error('[HubSpot] Candidate CRM Sync failed:', e.message))
     ]);
 
     res.status(201).json(entry);
@@ -1352,10 +1336,11 @@ app.post('/api/netlify-webhook', async (req, res) => {
     });
     await entry.save();
 
-    // Alert to admin + confirmation to candidate
+    // Alert to admin + confirmation to candidate + HubSpot CRM sync
     Promise.allSettled([
       sendEmail(emailTpl.newApplicationAlert(entry)),
       entry.email ? sendEmail({ ...emailTpl.applicationAutoReply(entry), to: entry.email }) : Promise.resolve(),
+      syncToHubSpot(entry, 'candidate').catch(e => console.error('[HubSpot] Webhook Candidate CRM Sync failed:', e.message))
     ]);
 
     return res.json({ received: true, id: entry.id, routed: 'applications' });
@@ -1377,6 +1362,7 @@ app.post('/api/netlify-webhook', async (req, res) => {
   Promise.allSettled([
     sendEmail(emailTpl.newEnquiryAlert(contact)),
     contact.email ? sendEmail({ ...emailTpl.enquiryAutoReply(contact), to: contact.email }) : Promise.resolve(),
+    syncToHubSpot(contact, 'contact').catch(e => console.error('[HubSpot] Webhook Contact CRM Sync failed:', e.message))
   ]);
 
   res.json({ received: true, id: contact.id, routed: 'contacts' });
@@ -1387,329 +1373,167 @@ app.post('/api/netlify-webhook', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
-// ZOHO OAUTH 2.0
+// HUBSPOT CRM INTEGRATION (API v3)
 // ─────────────────────────────────────────────
-// Flow overview:
-//   1. Super Admin visits GET /api/zoho/authorise  → redirected to Zoho consent screen
-//   2. Zoho redirects to GET /api/zoho/callback?code=XXX
-//   3. We exchange the code for access + refresh tokens → stored on disk
-//   4. Every outbound email calls getZohoAccessToken() which auto-refreshes when needed
-//   5. Set ZOHO_REFRESH_TOKEN env var on Render after step 3 so it survives restarts
-//
-// SETUP (one-time):
-//   a. Go to https://api-console.zoho.com → Add Client → Server-based Application
-//   b. Authorised Redirect URI: https://covenantcrest.co.uk/api/zoho/callback
-//      (or https://your-render-url.onrender.com/api/zoho/callback during setup)
-//   c. Copy Client ID + Secret → set as Render env vars
-//   d. Log in to admin → Settings → click "Authorise Zoho Mail"
-//   e. After redirect you'll see {"zoho":"connected"} — done!
-// ─────────────────────────────────────────────
-
-const ZOHO_TOKEN_FILE = path.join(DATA_DIR, 'zoho_tokens.json');
-
-// In-memory token cache (avoids repeated disk reads)
-let _zohoTokenCache = null;
-
-function loadZohoTokens() {
-  if (_zohoTokenCache) return _zohoTokenCache;
-  try {
-    if (fs.existsSync(ZOHO_TOKEN_FILE)) {
-      _zohoTokenCache = JSON.parse(fs.readFileSync(ZOHO_TOKEN_FILE, 'utf8'));
-      return _zohoTokenCache;
-    }
-  } catch (e) { /* ignore */ }
-  // Fall back to env var refresh token (set after first auth)
-  if (CFG.ZOHO_REFRESH_TOKEN) {
-    return { refresh_token: CFG.ZOHO_REFRESH_TOKEN, access_token: null, expires_at: 0 };
-  }
-  return null;
-}
-
-function saveZohoTokens(tokens) {
-  _zohoTokenCache = tokens;
-  try { fs.writeFileSync(ZOHO_TOKEN_FILE, JSON.stringify(tokens, null, 2), 'utf8'); } catch (e) { /* non-fatal */ }
-}
 
 /**
- * Returns a valid Zoho access token, refreshing automatically when expired.
- * Throws if Zoho is not configured.
+ * Synchronises Client requests and Candidate registration details directly
+ * to HubSpot CRM as contacts using a Private App Access Token.
  */
-async function getZohoAccessToken() {
-  if (!CFG.ZOHO_CLIENT_ID || !CFG.ZOHO_CLIENT_SECRET) {
-    throw new Error('Zoho OAuth not configured (ZOHO_CLIENT_ID / ZOHO_CLIENT_SECRET missing).');
+async function syncToHubSpot(data, type) {
+  if (!CFG.HUBSPOT_ACCESS_TOKEN) {
+    console.log('[HubSpot] Access Token not set. Skipping CRM synchronization.');
+    return null;
   }
 
-  const tokens = loadZohoTokens();
-  if (!tokens || !tokens.refresh_token) {
-    throw new Error('Zoho not authorised yet. Visit /api/zoho/authorise to connect.');
+  // Map fields logically (HubSpot CRM standard properties)
+  const properties = {
+    firstname: data.first_name || data.name?.split(' ')[0] || 'Unknown',
+    lastname: data.last_name || data.name?.split(' ').slice(1).join(' ') || 'Contact',
+    email: data.email || '',
+    phone: data.phone || '',
+  };
+
+  if (type === 'contact') {
+    properties.description = `[Client Staffing/General Enquiry]\nType: ${data.type || 'General'}\nSource: ${data.source || 'Website'}\nCompany: ${data.company || 'Not provided'}\n\nMessage:\n${data.message || ''}`;
+    if (data.company) {
+      properties.company = data.company;
+    }
+  } else if (type === 'candidate') {
+    properties.jobtitle = data.job_title || 'Applicant';
+    properties.description = `[Candidate Application Portal]\nSector: ${data.sector || 'General'}\nAvailability: ${data.availability || 'Not provided'}\nCV Cloudinary Link: ${data.cvUrl || 'None'}\n\nCompliance & Vetting Vitals:\nDBS Certificate: ${data.dbs_cert_number || 'N/A'}\nSIA License: ${data.sia_licence_number || 'N/A'}\nFood Hygiene Expiry/Level: ${data.food_hygiene_level || 'N/A'}\nHGV/CPC License details: ${data.hgv_license || 'N/A'}\n\nCandidate Personal Statement/Notes:\n${data.notes || ''}`;
   }
 
-  const now = Date.now();
-  // Access token still valid (with 60s buffer)
-  if (tokens.access_token && tokens.expires_at && now < tokens.expires_at - 60_000) {
-    return tokens.access_token;
-  }
-
-  // Refresh the access token
-  const body = new URLSearchParams({
-    grant_type    : 'refresh_token',
-    client_id     : CFG.ZOHO_CLIENT_ID,
-    client_secret : CFG.ZOHO_CLIENT_SECRET,
-    refresh_token : tokens.refresh_token,
-  }).toString();
+  const body = JSON.stringify({ properties });
 
   return new Promise((resolve, reject) => {
     const req = https.request({
-      hostname: CFG.ZOHO_ACCOUNTS_HOST,
-      path    : '/oauth/v2/token',
-      method  : 'POST',
-      headers : {
-        'Content-Type'  : 'application/x-www-form-urlencoded',
-        'Content-Length': Buffer.byteLength(body),
-      },
+      hostname: 'api.hubapi.com',
+      path: '/crm/v3/objects/contacts',
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${CFG.HUBSPOT_ACCESS_TOKEN}`,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body)
+      }
     }, (res) => {
-      let data = '';
-      res.on('data', d => data += d);
+      let d = '';
+      res.on('data', chunk => d += chunk);
       res.on('end', () => {
         try {
-          const json = JSON.parse(data);
-          if (!json.access_token) return reject(new Error('Zoho token refresh failed: ' + data));
-          const updated = {
-            ...tokens,
-            access_token: json.access_token,
-            expires_at  : Date.now() + (json.expires_in || 3600) * 1000,
-          };
-          saveZohoTokens(updated);
-          resolve(updated.access_token);
-        } catch (e) { reject(e); }
+          const parsed = JSON.parse(d);
+          if (res.statusCode >= 400) {
+            console.error('[HubSpot] CRM Sync Failed:', res.statusCode, d);
+            reject(new Error(parsed.message || 'CRM API Error ' + res.statusCode));
+          } else {
+            console.log('[HubSpot] Successfully synced contact ID:', parsed.id);
+            resolve(parsed);
+          }
+        } catch(e) { reject(e); }
       });
     });
-    req.on('error', reject);
+    req.on('error', (e) => {
+      console.error('[HubSpot] Network error during CRM sync:', e.message);
+      reject(e);
+    });
     req.write(body);
     req.end();
   });
 }
 
-/**
- * Send email via Zoho Mail API (ZeptoMail / Zoho Mail Send API v1)
- * Falls back to Resend if Zoho is not configured.
- */
-async function sendEmailViaZoho({ to, subject, html }) {
-  const accessToken = await getZohoAccessToken();
-  const recipients  = (Array.isArray(to) ? to : [to]).map(addr => ({ address: addr }));
+// ─────────────────────────────────────────────
+// TRANSACTIONAL EMAIL ENGINE (Resend)
+// ─────────────────────────────────────────────
 
+/**
+ * Direct email dispatcher utilizing the Resend API to deliver alerts
+ * straight to your corporate Outlook inbox.
+ */
+async function sendEmail({ to, subject, html }) {
+  if (!CFG.RESEND_API_KEY) {
+    console.warn('[email] Resend API Key is not set. Outbound mail was bypassed:', subject);
+    return Promise.resolve({ bypassed: true });
+  }
+
+  const recipients = Array.isArray(to) ? to : [to];
   const body = JSON.stringify({
-    from    : { address: CFG.ZOHO_FROM_EMAIL, name: CFG.ZOHO_FROM_NAME },
-    to      : recipients,
+    from   : `Covenant Crest <${CFG.EMAIL_FROM}>`,
+    to     : recipients,
     subject,
-    htmlbody: html,
+    html,
   });
 
   return new Promise((resolve, reject) => {
     const req = https.request({
-      hostname: CFG.ZOHO_MAIL_HOST,
-      path    : '/api/accounts/me/messages',
+      hostname: 'api.resend.com',
+      path    : '/emails',
       method  : 'POST',
       headers : {
-        'Authorization': `Zoho-oauthtoken ${accessToken}`,
+        'Authorization': `Bearer ${CFG.RESEND_API_KEY}`,
         'Content-Type' : 'application/json',
         'Content-Length': Buffer.byteLength(body),
       },
     }, (res) => {
-      let data = '';
-      res.on('data', d => data += d);
+      let d = '';
+      res.on('data', chunk => d += chunk);
       res.on('end', () => {
-        if (res.statusCode >= 400) {
-          console.error('[zoho-mail] Send failed:', res.statusCode, data);
-          return reject(new Error('Zoho mail send failed: ' + data));
-        }
-        resolve(JSON.parse(data));
+        try {
+          const json = JSON.parse(d);
+          if (res.statusCode >= 400) {
+            console.error('[resend] Mail Delivery Failed:', res.statusCode, d);
+            return reject(new Error(json.message || 'Resend error: ' + d));
+          }
+          console.log('[resend] Email dispatched successfully to:', recipients.join(', '));
+          resolve(json);
+        } catch(e) { reject(e); }
       });
     });
-    req.on('error', reject);
+    req.on('error', (e) => {
+      console.error('[resend] Network error:', e.message);
+      reject(e);
+    });
     req.write(body);
     req.end();
   });
 }
 
-/**
- * Master send function — tries Zoho first, falls back to Resend, then logs only.
- */
-async function sendEmail({ to, subject, html }) {
-  // Try Zoho if configured
-  if (CFG.ZOHO_CLIENT_ID && CFG.ZOHO_CLIENT_SECRET) {
-    try {
-      return await sendEmailViaZoho({ to, subject, html });
-    } catch (e) {
-      console.warn('[email] Zoho send failed, trying Resend fallback:', e.message);
-    }
-  }
-
-  // Try Resend fallback
-  if (CFG.RESEND_API_KEY) {
-    const body = JSON.stringify({
-      from   : `Covenant Crest <${CFG.EMAIL_FROM}>`,
-      to     : Array.isArray(to) ? to : [to],
-      subject,
-      html,
-    });
-    return new Promise((resolve, reject) => {
-      const req = https.request({
-        hostname: 'api.resend.com',
-        path    : '/emails',
-        method  : 'POST',
-        headers : {
-          'Authorization': `Bearer ${CFG.RESEND_API_KEY}`,
-          'Content-Type' : 'application/json',
-          'Content-Length': Buffer.byteLength(body),
-        },
-      }, (res) => {
-        let data = '';
-        res.on('data', d => data += d);
-        res.on('end', () => {
-          if (res.statusCode >= 400) { console.error('[resend] Error:', res.statusCode, data); return reject(new Error(data)); }
-          resolve(JSON.parse(data));
-        });
-      });
-      req.on('error', reject);
-      req.write(body);
-      req.end();
-    });
-  }
-
-  // Neither configured — log only
-  console.log('[email] No provider configured. Would have sent:', subject, '→', to);
-}
-
-// ── ZOHO OAUTH ROUTES ────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// DIAGNOSTIC TESTING ENDPOINTS (Super Admin only)
+// ─────────────────────────────────────────────
 
 /**
- * GET /api/zoho/authorise
- * Super Admin only — starts the OAuth flow.
- * Visit this URL in your browser while logged into the admin panel.
+ * POST /api/diagnostics/test-resend
+ * Sends a test email to verify the Resend connection.
  */
-app.get('/api/zoho/authorise', requireSuperAdmin, (req, res) => {
-  if (!CFG.ZOHO_CLIENT_ID) {
-    return res.status(400).json({ error: 'ZOHO_CLIENT_ID not set in environment variables.' });
-  }
-  const params = new URLSearchParams({
-    response_type: 'code',
-    client_id    : CFG.ZOHO_CLIENT_ID,
-    scope        : 'ZohoMail.messages.CREATE,ZohoMail.accounts.READ',
-    redirect_uri : CFG.ZOHO_REDIRECT_URI,
-    access_type  : 'offline',
-    prompt       : 'consent',
-  });
-  res.redirect(`https://${CFG.ZOHO_ACCOUNTS_HOST}/oauth/v2/auth?${params.toString()}`);
-});
-
-/**
- * GET /api/zoho/callback?code=XXX
- * Zoho redirects here after the user grants permission.
- * Exchanges the auth code for access + refresh tokens.
- */
-app.get('/api/zoho/callback', async (req, res) => {
-  const { code, error } = req.query;
-  if (error || !code) {
-    return res.status(400).send(`<h2>Zoho OAuth Error</h2><p>${error || 'No code returned'}</p>`);
-  }
-  if (!CFG.ZOHO_CLIENT_ID || !CFG.ZOHO_CLIENT_SECRET) {
-    return res.status(400).send('<h2>Error</h2><p>ZOHO_CLIENT_ID / ZOHO_CLIENT_SECRET not configured.</p>');
-  }
-
-  const body = new URLSearchParams({
-    grant_type   : 'authorization_code',
-    client_id    : CFG.ZOHO_CLIENT_ID,
-    client_secret: CFG.ZOHO_CLIENT_SECRET,
-    redirect_uri : CFG.ZOHO_REDIRECT_URI,
-    code,
-  }).toString();
-
+app.post('/api/diagnostics/test-resend', requireSuperAdmin, async (req, res) => {
   try {
-    const tokens = await new Promise((resolve, reject) => {
-      const req2 = https.request({
-        hostname: CFG.ZOHO_ACCOUNTS_HOST,
-        path    : '/oauth/v2/token',
-        method  : 'POST',
-        headers : {
-          'Content-Type'  : 'application/x-www-form-urlencoded',
-          'Content-Length': Buffer.byteLength(body),
-        },
-      }, (r) => {
-        let data = '';
-        r.on('data', d => data += d);
-        r.on('end', () => {
-          try { resolve(JSON.parse(data)); } catch (e) { reject(e); }
-        });
-      });
-      req2.on('error', reject);
-      req2.write(body);
-      req2.end();
+    const testResult = await sendEmail({
+      to     : CFG.EMAIL_NOTIFY,
+      subject: '✅ Covenant Crest — Resend Transactional Mail Test',
+      html   : `<div style="font-family:Arial,sans-serif;padding:24px;background:#0D1B2A;color:#fff;border-radius:8px;"><h2 style="color:#C9A84C;margin:0 0 16px;">Test Successful</h2><p>Resend mail delivery engine is working perfectly for <strong>Covenant Crest Group Ltd</strong>.</p><p>Dispatched to: <strong>${CFG.EMAIL_NOTIFY}</strong></p><p>Sent: ${new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' })}</p></div>`,
     });
-
-    if (!tokens.refresh_token) {
-      return res.status(400).send(`<h2>Error</h2><p>No refresh token returned. Try revoking access in Zoho and authorising again.</p><pre>${JSON.stringify(tokens, null, 2)}</pre>`);
-    }
-
-    saveZohoTokens({
-      refresh_token: tokens.refresh_token,
-      access_token : tokens.access_token,
-      expires_at   : Date.now() + (tokens.expires_in || 3600) * 1000,
-    });
-
-    console.log('✅ Zoho OAuth connected. Refresh token saved.');
-    console.log('   ⚠  Also set ZOHO_REFRESH_TOKEN=' + tokens.refresh_token + ' in Render env vars so it survives restarts.');
-
-    res.send(`
-      <html><body style="font-family:sans-serif;max-width:520px;margin:60px auto;padding:24px;">
-        <h2 style="color:#1D9E75;">✅ Zoho Mail Connected!</h2>
-        <p>Covenant Crest is now authorised to send emails via <strong>${CFG.ZOHO_FROM_EMAIL}</strong>.</p>
-        <p><strong>Important:</strong> Copy the refresh token below and set it as the
-        <code>ZOHO_REFRESH_TOKEN</code> environment variable on Render.com so it
-        survives service restarts:</p>
-        <pre style="background:#f5f5f5;padding:12px;border-radius:4px;word-break:break-all;">${tokens.refresh_token}</pre>
-        <p><a href="/admin.html">← Back to Admin Panel</a></p>
-      </body></html>
-    `);
-  } catch (err) {
-    console.error('Zoho callback error:', err);
-    res.status(500).send(`<h2>Error</h2><p>${err.message}</p>`);
+    res.json({ success: true, message: 'Test email sent to ' + CFG.EMAIL_NOTIFY, result: testResult });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
   }
 });
 
 /**
- * GET /api/zoho/status
- * Returns Zoho connection status for the Settings panel.
+ * POST /api/diagnostics/test-hubspot
+ * Pushes a mock contact to HubSpot to test credentials and pipeline sync.
  */
-app.get('/api/zoho/status', requireSuperAdmin, (req, res) => {
-  const tokens = loadZohoTokens();
-  const configured = !!(CFG.ZOHO_CLIENT_ID && CFG.ZOHO_CLIENT_SECRET);
-  const connected  = !!(tokens && tokens.refresh_token);
-  const tokenValid = !!(tokens && tokens.access_token && tokens.expires_at && Date.now() < tokens.expires_at - 60_000);
-  res.json({
-    configured,
-    connected,
-    tokenValid,
-    fromEmail: configured ? CFG.ZOHO_FROM_EMAIL : null,
-    message  : !configured ? 'Set ZOHO_CLIENT_ID and ZOHO_CLIENT_SECRET in Render env vars.'
-             : !connected  ? 'Not authorised yet. Click "Authorise Zoho Mail" in Settings.'
-             : tokenValid  ? 'Connected and token valid.'
-             : 'Connected — token will refresh automatically on next send.',
-  });
-});
-
-/**
- * POST /api/zoho/test
- * Super Admin only — sends a test email to verify the connection.
- */
-app.post('/api/zoho/test', requireSuperAdmin, async (req, res) => {
+app.post('/api/diagnostics/test-hubspot', requireSuperAdmin, async (req, res) => {
   try {
-    await sendEmail({
-      to     : CFG.ZOHO_FROM_EMAIL,
-      subject: '✅ Covenant Crest — Zoho Mail Test',
-      html   : `<div style="font-family:Arial,sans-serif;padding:24px;"><h2 style="color:#C9A84C;">Test Email</h2><p>Zoho Mail is working correctly for <strong>Covenant Crest Group Ltd</strong>.</p><p>Sent: ${new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' })}</p></div>`,
-    });
-    res.json({ success: true, message: 'Test email sent to ' + CFG.ZOHO_FROM_EMAIL });
+    const testContact = {
+      name: 'HubSpot Test Run',
+      email: `test-${Date.now()}@covenantcrest.co.uk`,
+      phone: '07000000000',
+      type: 'Diagnostic Sync Test',
+      message: 'This is an automated request verifying that the HubSpot Private App Token CRM sync is functional.',
+      source: 'Admin Diagnostics Panel'
+    };
+    const syncResult = await syncToHubSpot(testContact, 'contact');
+    res.json({ success: true, message: 'Mock contact pushed successfully to HubSpot CRM.', result: syncResult });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
@@ -1729,30 +1553,30 @@ app.use((err, req, res, _next) => {
 // START
 // ─────────────────────────────────────────────
 app.listen(PORT, () => {
-  const zohoTokens = loadZohoTokens();
-  console.log(`\n🚀 Covenant Crest API v2.0 running on port ${PORT}`);
-  console.log(`   Super Admin : ${CFG.SUPER_ADMIN_EMAIL}`);
-  console.log(`   Allowed origin: ${CFG.ALLOWED_ORIGIN}`);
-  console.log(`   Email — Zoho  : ${CFG.ZOHO_CLIENT_ID ? (zohoTokens?.refresh_token ? '✅ connected' : '⚠️  not authorised — visit /api/zoho/authorise') : '⚠️  ZOHO_CLIENT_ID not set'}`);
-  console.log(`   Email — Resend: ${CFG.RESEND_API_KEY ? '✅ configured (fallback)' : '— not set'}`);
-  console.log(`   Cloudinary    : ${CFG.CLOUDINARY_KEY  ? '✅ configured' : '⚠️  credentials not set'}`);
-  console.log('\n📋 Endpoints:');
+  console.log(`\n🚀 Covenant Crest Elite API v3.0 running on port ${PORT}`);
+  console.log(`   Super Admin   : ${CFG.SUPER_ADMIN_EMAIL}`);
+  console.log(`   Allowed Origin: ${CFG.ALLOWED_ORIGIN}`);
+  console.log(`   CRM Engine    : ${CFG.HUBSPOT_ACCESS_TOKEN ? '✅ HubSpot API v3 CRM Active' : '⚠️  HUBSPOT_ACCESS_TOKEN not set'}`);
+  console.log(`   Mail Engine   : ${CFG.RESEND_API_KEY ? '✅ Resend Outbound Service Active' : '⚠️  RESEND_API_KEY not set'}`);
+  console.log(`   Microsoft SSO : ${CFG.MICROSOFT_CLIENT_ID ? '✅ Azure AD SSO Configured' : '⚠️  MICROSOFT_CLIENT_ID not set'}`);
+  console.log(`   Cloudinary    : ${CFG.CLOUDINARY_KEY  ? '✅ Assets CDN Configured' : '⚠️  credentials not set'}`);
+  console.log('\n📋 Active Premium Endpoints:');
   [
-    'GET    /api/jobs              — public job listings',
-    'POST   /api/auth/login        — get JWT token',
-    'GET    /api/auth/me           — current user',
-    'GET    /api/contacts          — view enquiries (auth)',
-    'POST   /api/contacts          — submit enquiry (public)',
-    'GET    /api/applications      — view applications (auth)',
-    'POST   /api/applications      — submit application (public)',
-    'POST   /api/upload            — upload image to Cloudinary (auth)',
-    'GET    /api/users             — user list (super admin)',
-    'POST   /api/users             — create employee (super admin)',
-    'POST   /api/netlify-webhook   — Netlify form webhook',
-    'GET    /api/zoho/authorise    — start Zoho OAuth flow (super admin)',
-    'GET    /api/zoho/callback     — Zoho OAuth redirect URI',
-    'GET    /api/zoho/status       — Zoho connection status (super admin)',
-    'POST   /api/zoho/test         — send test email (super admin)',
+    'GET    /api/jobs                — public job listings',
+    'POST   /api/auth/login          — traditional user login',
+    'GET    /api/auth/me             — retrieve active session',
+    'GET    /api/auth/microsoft-login — start secure Microsoft Admin SSO',
+    'GET    /api/auth/microsoft-callback — secure Microsoft auth callback',
+    'GET    /api/contacts            — view client inquiries (auth)',
+    'POST   /api/contacts            — submit express booking wizard (public)',
+    'GET    /api/applications        — view candidate compliance portal (auth)',
+    'POST   /api/applications        — submit pre-vetted compliance registration (public)',
+    'POST   /api/upload              — upload candidate CV/assets to Cloudinary (auth)',
+    'GET    /api/users               — list admin users (super admin)',
+    'POST   /api/users               — spawn employee credentials (super admin)',
+    'POST   /api/netlify-webhook     — Netlify form webhook processor',
+    'POST   /api/diagnostics/test-resend — dispatch Resend test email (super admin)',
+    'POST   /api/diagnostics/test-hubspot — verify HubSpot CRM token sync (super admin)',
   ].forEach(e => console.log('   ' + e));
   console.log('');
 });
