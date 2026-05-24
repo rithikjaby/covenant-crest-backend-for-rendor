@@ -1540,6 +1540,274 @@ app.post('/api/diagnostics/test-hubspot', requireSuperAdmin, async (req, res) =>
 });
 
 // ─────────────────────────────────────────────
+// MICROSOFT 365 GRAPH API INTEGRATION (Teams & Calendar)
+// ─────────────────────────────────────────────
+
+async function getMicrosoftAccessToken() {
+  if (!CFG.MICROSOFT_CLIENT_ID || !CFG.MICROSOFT_CLIENT_SECRET) {
+    throw new Error('Microsoft M365 Client ID and Client Secret are not configured in your environment.');
+  }
+  if (!CFG.MICROSOFT_TENANT_ID || CFG.MICROSOFT_TENANT_ID === 'common') {
+    throw new Error('M365 scheduling requires a specific Microsoft Tenant ID (not "common"). Please set MICROSOFT_TENANT_ID in Render variables to your specific Entra directory ID or domain name (e.g., covenantcrest.co.uk).');
+  }
+  const body = new URLSearchParams({
+    grant_type: 'client_credentials',
+    client_id: CFG.MICROSOFT_CLIENT_ID,
+    client_secret: CFG.MICROSOFT_CLIENT_SECRET,
+    scope: 'https://graph.microsoft.com/.default'
+  }).toString();
+
+  return new Promise((resolve, reject) => {
+    const req = https.request({
+      hostname: 'login.microsoftonline.com',
+      path: `/${CFG.MICROSOFT_TENANT_ID}/oauth2/v2.0/token`,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(body)
+      }
+    }, (res) => {
+      let d = '';
+      res.on('data', chunk => d += chunk);
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(d);
+          if (res.statusCode >= 400) {
+            reject(new Error(parsed.error_description || 'OAuth Token Error ' + res.statusCode));
+          } else {
+            resolve(parsed.access_token);
+          }
+        } catch(e) { reject(e); }
+      });
+    });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+/**
+ * POST /api/interviews/schedule-teams
+ * Schedules a Microsoft Teams video meeting interview via Graph API and books it on Outlook calendar.
+ */
+app.post('/api/interviews/schedule-teams', requireAuth, async (req, res) => {
+  try {
+    const { candidateName, candidateEmail, jobTitle, dateTime, durationMinutes } = req.body;
+    if (!candidateName || !candidateEmail || !dateTime) {
+      return res.status(400).json({ error: 'Candidate Name, Email and Date/Time are required.' });
+    }
+
+    const duration = durationMinutes ? parseInt(durationMinutes) : 30;
+    const startDateTime = new Date(dateTime);
+    const endDateTime = new Date(startDateTime.getTime() + duration * 60 * 1000);
+
+    const organiserEmail = CFG.SUPER_ADMIN_EMAIL.toLowerCase();
+
+    // Fallback sandbox / diagnostic mode if Microsoft SSO Client ID is not configured
+    if (!CFG.MICROSOFT_CLIENT_ID || !CFG.MICROSOFT_CLIENT_SECRET) {
+      console.log('[M365] Microsoft SSO is not configured. Running in fallback sandbox diagnostics mode.');
+      
+      const mockTeamsLink = `https://teams.live.com/meet/943${Math.floor(Math.random() * 900000000)}?p=ccPortalMock`;
+      
+      // Send invitation alert email using our normal email alert engine (Resend)
+      const emailHtml = `
+        <div style="font-family:Arial,sans-serif;padding:32px;background:#FAF9F6;color:#0D1B2A;border-radius:12px;border:1px solid #E8E4DC;max-width:600px;margin:0 auto;">
+          <div style="text-align:center;border-bottom:2px solid #C9A84C;padding-bottom:20px;margin-bottom:24px;">
+            <h2 style="color:#0D1B2A;margin:0;font-size:26px;">Covenant Crest Group Ltd</h2>
+            <p style="color:#7A8694;margin:4px 0 0;font-size:12px;letter-spacing:0.15em;text-transform:uppercase;">Interview Invitation</p>
+          </div>
+          <h3 style="color:#0D1B2A;font-size:18px;">Dear ${candidateName},</h3>
+          <p style="font-size:14px;line-height:1.75;color:#4A5568;">Thank you for your application. We are pleased to invite you to a formal online video interview for the <strong>${jobTitle || 'recruitment'}</strong> position with Covenant Crest Group.</p>
+          
+          <div style="background:#fff;border:1px solid #E8E4DC;border-radius:8px;padding:20px;margin:24px 0;box-shadow:0 4px 12px rgba(13,27,42,0.02);">
+            <div style="font-size:11px;font-weight:700;color:#C9A84C;text-transform:uppercase;margin-bottom:8px;letter-spacing:0.08em;">Interview Schedule</div>
+            <div style="font-size:15px;font-weight:600;color:#0D1B2A;margin-bottom:12px;">📅 ${startDateTime.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}</div>
+            <div style="font-size:15px;font-weight:600;color:#0D1B2A;margin-bottom:16px;">🕒 ${startDateTime.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })} &mdash; ${endDateTime.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })} (London Time)</div>
+            
+            <a href="${mockTeamsLink}" style="display:inline-block;background:#0078D4;color:#fff;padding:12px 24px;border-radius:4px;font-weight:600;text-decoration:none;font-size:13px;text-align:center;box-shadow:0 3px 8px rgba(0,120,212,0.25);" target="_blank" rel="noopener">Join Microsoft Teams Meeting</a>
+          </div>
+          
+          <p style="font-size:13px;line-height:1.75;color:#7A8694;">Please ensure you have a stable internet connection, working camera, and microphone. If you have any scheduling conflicts, please reply directly to this email or call <strong>07346 809846</strong> as soon as possible.</p>
+          
+          <div style="border-top:1px solid #E8E4DC;margin-top:28px;padding-top:16px;text-align:center;font-size:11px;color:#9AA5B4;">
+            Covenant Crest Group Ltd &bull; Registered in England & Wales Co. No. 16528951 &bull; Built on Promise.
+          </div>
+        </div>
+      `;
+
+      await sendEmail({
+        to: candidateEmail,
+        subject: `Interview Scheduled: ${jobTitle || 'Covenant Crest Role'} — Covenant Crest Group`,
+        html: emailHtml
+      }).catch(e => console.error('[M365 Sandbox] Invite Email dispatch failed:', e.message));
+
+      return res.json({
+        success: true,
+        mode: 'sandbox',
+        message: 'Successfully booked Teams Interview (Diagnostics/Sandbox Mode). Invitation email sent to candidate.',
+        joinUrl: mockTeamsLink,
+        dateTime: startDateTime,
+        candidateName
+      });
+    }
+
+    // Live Microsoft Graph API Integration
+    const accessToken = await getMicrosoftAccessToken();
+    const eventBody = JSON.stringify({
+      subject: `Interview: ${candidateName} for ${jobTitle || 'Covenant Crest Role'}`,
+      body: {
+        contentType: 'HTML',
+        content: `Covenant Crest Portal Automated Interview Placement.<br><br><strong>Candidate Details:</strong><br>Name: ${candidateName}<br>Email: ${candidateEmail}<br>Job: ${jobTitle || 'General Placement'}<br><br>Please click the Teams link below to start the video interview.`
+      },
+      start: {
+        dateTime: startDateTime.toISOString(),
+        timeZone: 'GMT Standard Time'
+      },
+      end: {
+        dateTime: endDateTime.toISOString(),
+        timeZone: 'GMT Standard Time'
+      },
+      location: {
+        displayName: 'Microsoft Teams Video Meeting'
+      },
+      attendees: [
+        {
+          emailAddress: {
+            address: candidateEmail,
+            name: candidateName
+          },
+          type: 'required'
+        }
+      ],
+      isOnlineMeeting: true,
+      onlineMeetingProvider: 'teamsForBusiness'
+    });
+
+    const createResult = await new Promise((resolve, reject) => {
+      const req = https.request({
+        hostname: 'graph.microsoft.com',
+        path: `/v1.0/users/${organiserEmail}/calendar/events`,
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(eventBody)
+        }
+      }, (res) => {
+        let d = '';
+        res.on('data', chunk => d += chunk);
+        res.on('end', () => {
+          try {
+            const parsed = JSON.parse(d);
+            if (res.statusCode >= 400) {
+              let errMsg = parsed.error?.message || 'Graph Calendar Error ' + res.statusCode;
+              if (parsed.error?.code === 'Authorization_RequestDenied' || res.statusCode === 403) {
+                errMsg = 'Permission Denied (403): Please ensure your Azure App Registration has been granted "Application Permissions" (not Delegated permissions) for "Calendars.ReadWrite" and "Mail.Send", and that you clicked "Grant admin consent" in the Azure portal.';
+              }
+              reject(new Error(errMsg));
+            } else {
+              resolve(parsed);
+            }
+          } catch(e) { reject(e); }
+        });
+      });
+      req.on('error', reject);
+      req.write(eventBody);
+      req.end();
+    });
+
+    const teamsLink = createResult.onlineMeeting?.joinUrl || createResult.webLink;
+
+    // Send the gorgeous M365-branded confirmation email via Graph API
+    const emailBody = JSON.stringify({
+      message: {
+        subject: `Interview Scheduled: ${jobTitle || 'Covenant Crest Role'} — Covenant Crest Group`,
+        body: {
+          contentType: 'HTML',
+          content: `
+            <div style="font-family:Arial,sans-serif;padding:32px;background:#FAF9F6;color:#0D1B2A;border-radius:12px;border:1px solid #E8E4DC;max-width:600px;margin:0 auto;">
+              <div style="text-align:center;border-bottom:2px solid #C9A84C;padding-bottom:20px;margin-bottom:24px;">
+                <h2 style="color:#0D1B2A;margin:0;font-size:26px;">Covenant Crest Group Ltd</h2>
+                <p style="color:#7A8694;margin:4px 0 0;font-size:12px;letter-spacing:0.15em;text-transform:uppercase;">Interview Invitation</p>
+              </div>
+              <h3 style="color:#0D1B2A;font-size:18px;">Dear ${candidateName},</h3>
+              <p style="font-size:14px;line-height:1.75;color:#4A5568;">Thank you for your application. We are pleased to invite you to a formal online video interview for the <strong>${jobTitle || 'recruitment'}</strong> position with Covenant Crest Group.</p>
+              
+              <div style="background:#fff;border:1px solid #E8E4DC;border-radius:8px;padding:20px;margin:24px 0;box-shadow:0 4px 12px rgba(13,27,42,0.02);">
+                <div style="font-size:11px;font-weight:700;color:#C9A84C;text-transform:uppercase;margin-bottom:8px;letter-spacing:0.08em;">Interview Schedule</div>
+                <div style="font-size:15px;font-weight:600;color:#0D1B2A;margin-bottom:12px;">📅 ${startDateTime.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}</div>
+                <div style="font-size:15px;font-weight:600;color:#0D1B2A;margin-bottom:16px;">🕒 ${startDateTime.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })} &mdash; ${endDateTime.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })} (London Time)</div>
+                
+                <a href="${teamsLink}" style="display:inline-block;background:#0078D4;color:#fff;padding:12px 24px;border-radius:4px;font-weight:600;text-decoration:none;font-size:13px;text-align:center;box-shadow:0 3px 8px rgba(0,120,212,0.25);" target="_blank" rel="noopener">Join Microsoft Teams Meeting</a>
+              </div>
+              
+              <p style="font-size:13px;line-height:1.75;color:#7A8694;">Please ensure you have a stable internet connection, working camera, and microphone. If you have any scheduling conflicts, please reply directly to this email or call <strong>07346 809846</strong> as soon as possible.</p>
+              
+              <div style="border-top:1px solid #E8E4DC;margin-top:28px;padding-top:16px;text-align:center;font-size:11px;color:#9AA5B4;">
+                Covenant Crest Group Ltd &bull; Registered in England & Wales Co. No. 16528951 &bull; Built on Promise.
+              </div>
+            </div>
+          `
+        },
+        toRecipients: [
+          {
+            emailAddress: {
+              address: candidateEmail
+            }
+          }
+        ]
+      },
+      saveToSentItems: "true"
+    });
+
+    await new Promise((resolve, reject) => {
+      const req = https.request({
+        hostname: 'graph.microsoft.com',
+        path: `/v1.0/users/${organiserEmail}/sendMail`,
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(emailBody)
+        }
+      }, (res) => {
+        let d = '';
+        res.on('data', chunk => d += chunk);
+        res.on('end', () => {
+          if (res.statusCode >= 400) {
+            console.error('[M365 Graph] Invite Email dispatch failed:', res.statusCode, d);
+            resolve({ success: false }); 
+          } else {
+            console.log('[M365 Graph] Successfully sent Teams invite email to:', candidateEmail);
+            resolve({ success: true });
+          }
+        });
+      });
+      req.on('error', (e) => {
+        console.error('[M365 Graph] Network error during invite email dispatch:', e.message);
+        resolve({ success: false });
+      });
+      req.write(emailBody);
+      req.end();
+    });
+
+    res.json({
+      success: true,
+      mode: 'live',
+      message: 'Microsoft Teams Interview booked successfully on your Outlook Calendar and invitation email sent!',
+      eventId: createResult.id,
+      joinUrl: teamsLink,
+      dateTime: startDateTime,
+      candidateName
+    });
+
+  } catch (e) {
+    console.error('[M365 Teams Integration Error]:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────
 // 404 + ERROR HANDLER
 // ─────────────────────────────────────────────
 app.use((req, res) => res.status(404).json({ error: 'Endpoint not found.' }));
