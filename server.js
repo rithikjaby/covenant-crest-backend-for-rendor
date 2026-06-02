@@ -89,8 +89,8 @@ const PORT = process.env.PORT || 3001;
 // ─────────────────────────────────────────────
 const CFG = {
   SUPER_ADMIN_EMAIL : process.env.SUPER_ADMIN_EMAIL || 'jaby.k@covenantcrest.co.uk',
-  SUPER_ADMIN_PWD   : process.env._SAVED_ADMIN_PW || process.env.SUPER_ADMIN_PWD || 'ChangeMe2025!',
-  JWT_SECRET        : process.env.JWT_SECRET        || crypto.randomBytes(32).toString('hex'),
+  SUPER_ADMIN_PWD   : process.env._SAVED_ADMIN_PW || process.env.SUPER_ADMIN_PWD || (() => { console.error('\n⚠️  CRITICAL: SUPER_ADMIN_PWD env var is not set. Using insecure default. Set SUPER_ADMIN_PWD in Render → Environment immediately.\n'); return 'ChangeMe2025!'; })(),
+  JWT_SECRET        : process.env.JWT_SECRET        || (() => { console.error('\n⚠️  CRITICAL: JWT_SECRET env var is not set. Sessions will be invalidated on every restart. Set JWT_SECRET in Render → Environment.\n'); return crypto.randomBytes(32).toString('hex'); })(),
   ALLOWED_ORIGIN    : process.env.ALLOWED_ORIGIN    || 'https://covenantcrest.co.uk',
 
   // Email (Resend)
@@ -112,7 +112,7 @@ const CFG = {
   // Microsoft SSO (Azure AD OAuth 2.0)
   MICROSOFT_CLIENT_ID    : process.env.MICROSOFT_CLIENT_ID || '',
   MICROSOFT_CLIENT_SECRET: process.env.MICROSOFT_CLIENT_SECRET || '',
-  MICROSOFT_REDIRECT_URI : process.env.MICROSOFT_REDIRECT_URI || 'https://covenantcrest.co.uk/api/auth/microsoft-callback',
+  MICROSOFT_REDIRECT_URI : process.env.MICROSOFT_REDIRECT_URI || 'https://www.covenantcrest.co.uk/api/auth/microsoft-callback',
   MICROSOFT_TENANT_ID    : process.env.MICROSOFT_TENANT_ID || 'common',
 
   // Database
@@ -177,6 +177,7 @@ const ContactSchema = new mongoose.Schema({
   name: String,
   email: String,
   phone: String,
+  company: String, // Bug 7: Structured B2B company field
   type: String,
   message: String,
   source: String,
@@ -221,9 +222,41 @@ const AppSchema = new mongoose.Schema({
   date: { type: Date, default: Date.now }
 }, { timestamps: true });
 
+const UserSchema = new mongoose.Schema({
+  id: { type: String, unique: true },
+  email: { type: String, unique: true },
+  password: String,
+  role: { type: String, default: 'employee' },
+  created: { type: Date, default: Date.now }
+}, { timestamps: true });
+
+const SecurityLogSchema = new mongoose.Schema({
+  id: { type: String, unique: true },
+  timestamp: { type: Date, default: Date.now },
+  type: String,
+  email: String,
+  ip: String,
+  userAgent: String,
+  role: String,
+  exists: Boolean,
+}, { timestamps: true });
+
 const Job = mongoose.models.Job || mongoose.model('Job', JobSchema);
 const Contact = mongoose.models.Contact || mongoose.model('Contact', ContactSchema);
 const Application = mongoose.models.Application || mongoose.model('Application', AppSchema);
+const User = mongoose.models.User || mongoose.model('User', UserSchema);
+const SecurityLog = mongoose.models.SecurityLog || mongoose.model('SecurityLog', SecurityLogSchema);
+
+// ── Job Alert Schema ─────────────────────────────────────────────────────────
+const JobAlertSchema = new mongoose.Schema({
+  id           : { type: String, unique: true },
+  email        : { type: String, required: true, lowercase: true, trim: true },
+  sectors      : [{ type: String }],           // [] = all sectors
+  token        : { type: String, unique: true },// unsubscribe token
+  confirmed    : { type: Boolean, default: true },
+  createdAt    : { type: Date, default: Date.now },
+});
+const JobAlert = mongoose.models.JobAlert || mongoose.model('JobAlert', JobAlertSchema);
 
 // ─────────────────────────────────────────────
 // JSON FILE HELPERS (Kept for fallback/migration)
@@ -259,23 +292,76 @@ function sanitise(str, max = 500) {
   return str.trim().slice(0, max);
 }
 
+// ── Cookie helpers ────────────────────────────────────────────────
+// Parse Cookie header into key/value object (no external library needed)
+function parseCookies(req) {
+  const header = req.headers.cookie || '';
+  return header.split(';').reduce((acc, pair) => {
+    const idx = pair.indexOf('=');
+    if (idx < 1) return acc;
+    const key = pair.slice(0, idx).trim();
+    const val = pair.slice(idx + 1).trim();
+    try { acc[key] = decodeURIComponent(val); } catch { acc[key] = val; }
+    return acc;
+  }, {});
+}
+
+function setSessionCookie(res, token) {
+  res.setHeader('Set-Cookie', [
+    `cc_session=${encodeURIComponent(token)}; HttpOnly; Path=/; Max-Age=${7 * 24 * 60 * 60}; SameSite=Strict${process.env.RENDER ? '; Secure' : ''}`
+  ]);
+}
+
+function clearSessionCookie(res) {
+  res.setHeader('Set-Cookie', [
+    'cc_session=; HttpOnly; Path=/; Max-Age=0; SameSite=Strict'
+  ]);
+}
+
+// ── One-time SSO code store (replaces JWT-in-URL-fragment) ────────
+// Code is valid for 90 seconds — enough for the page load and exchange
+const ssoCodeStore = new Map();
+setInterval(() => {
+  const now = Date.now();
+  for (const [code, data] of ssoCodeStore) {
+    if (data.expires < now) ssoCodeStore.delete(code);
+  }
+}, 30000).unref();
+
+// Escape HTML special chars before inserting user-supplied text into email HTML
+function htmlEsc(str) {
+  if (!str) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#x27;');
+}
+
 /**
- * Log security events (failed logins, password changes)
+ * Log security events (failed logins, password changes) — stored in MongoDB
  */
 function logSecurityEvent(type, email, req, details = {}) {
   try {
-    const logs = readJSON(FILES.security);
-    logs.unshift({
-      id: uid(),
-      timestamp: new Date().toISOString(),
+    const entry = new SecurityLog({
+      id:        uid(),
+      timestamp: new Date(),
       type,
-      email: email.toLowerCase(),
-      ip: req.ip || req.headers['x-forwarded-for'] || 'unknown',
+      email:     email.toLowerCase(),
+      ip:        req.ip || req.headers['x-forwarded-for'] || 'unknown',
       userAgent: req.headers['user-agent'],
       ...details
     });
-    // Keep only last 200 events
-    writeJSON(FILES.security, logs.slice(0, 200));
+    entry.save().catch(e => console.error('Security log save failed:', e.message));
+    // Prune to keep only the last 200 events (non-blocking)
+    SecurityLog.countDocuments().then(count => {
+      if (count > 200) {
+        SecurityLog.find().sort({ timestamp: 1 }).limit(count - 200)
+          .then(old => SecurityLog.deleteMany({ _id: { $in: old.map(o => o._id) } }))
+          .catch(() => {});
+      }
+    }).catch(() => {});
   } catch (e) { console.error('Security log failed:', e.message); }
 }
 
@@ -355,12 +441,12 @@ const emailTpl = {
           </div>
           <div style="background:#fff;padding:24px;border-radius:0 0 6px 6px;border:1px solid #e0e0e0;">
             <table style="width:100%;border-collapse:collapse;">
-              <tr><td style="padding:8px 0;color:#666;font-size:13px;width:120px;">Name</td><td style="padding:8px 0;font-weight:600;font-size:13px;">${name}</td></tr>
-              <tr><td style="padding:8px 0;color:#666;font-size:13px;">Email</td><td style="padding:8px 0;font-size:13px;"><a href="mailto:${email}" style="color:#C9A84C;">${email}</a></td></tr>
-              <tr><td style="padding:8px 0;color:#666;font-size:13px;">Phone</td><td style="padding:8px 0;font-size:13px;">${phone || 'Not provided'}</td></tr>
-              <tr><td style="padding:8px 0;color:#666;font-size:13px;">Type</td><td style="padding:8px 0;font-size:13px;">${type || 'General'}</td></tr>
-              <tr><td style="padding:8px 0;color:#666;font-size:13px;">Source</td><td style="padding:8px 0;font-size:13px;">${source || 'website'}</td></tr>
-              <tr><td style="padding:8px 0;color:#666;font-size:13px;vertical-align:top;">Message</td><td style="padding:8px 0;font-size:13px;line-height:1.6;">${(message || '').replace(/\n/g, '<br>')}</td></tr>
+              <tr><td style="padding:8px 0;color:#666;font-size:13px;width:120px;">Name</td><td style="padding:8px 0;font-weight:600;font-size:13px;">${htmlEsc(name)}</td></tr>
+              <tr><td style="padding:8px 0;color:#666;font-size:13px;">Email</td><td style="padding:8px 0;font-size:13px;"><a href="mailto:${htmlEsc(email)}" style="color:#C9A84C;">${htmlEsc(email)}</a></td></tr>
+              <tr><td style="padding:8px 0;color:#666;font-size:13px;">Phone</td><td style="padding:8px 0;font-size:13px;">${htmlEsc(phone) || 'Not provided'}</td></tr>
+              <tr><td style="padding:8px 0;color:#666;font-size:13px;">Type</td><td style="padding:8px 0;font-size:13px;">${htmlEsc(type) || 'General'}</td></tr>
+              <tr><td style="padding:8px 0;color:#666;font-size:13px;">Source</td><td style="padding:8px 0;font-size:13px;">${htmlEsc(source) || 'website'}</td></tr>
+              <tr><td style="padding:8px 0;color:#666;font-size:13px;vertical-align:top;">Message</td><td style="padding:8px 0;font-size:13px;line-height:1.6;">${htmlEsc(message || '').replace(/\n/g, '<br>')}</td></tr>
             </table>
             <hr style="margin:16px 0;border:none;border-top:1px solid #eee;">
             <p style="font-size:11px;color:#999;margin:0;">Received: ${new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' })} · Source: ${source}</p>
@@ -383,7 +469,7 @@ const emailTpl = {
       html   : `
         <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#f8f8f8;padding:24px;border-radius:8px;">
           <div style="background:#0D1B2A;padding:20px 24px;border-radius:6px 6px 0 0;text-align:center;">
-            <h2 style="color:#C9A84C;margin:0;font-size:20px;">Thank You, ${name}</h2>
+            <h2 style="color:#C9A84C;margin:0;font-size:20px;">Thank You, ${htmlEsc(name)}</h2>
           </div>
           <div style="background:#fff;padding:24px;border-radius:0 0 6px 6px;border:1px solid #e0e0e0;">
             <p style="font-size:14px;line-height:1.7;color:#333;">We have received your <strong>${typeLabel}</strong> enquiry and a member of our team will be in touch shortly.</p>
@@ -407,8 +493,8 @@ const emailTpl = {
             <h2 style="color:#C9A84C;margin:0;font-size:20px;">Application Received</h2>
           </div>
           <div style="background:#fff;padding:24px;border-radius:0 0 6px 6px;border:1px solid #e0e0e0;">
-            <p style="font-size:14px;line-height:1.7;color:#333;">Dear <strong>${first_name} ${last_name}</strong>,</p>
-            <p style="font-size:14px;line-height:1.7;color:#333;">Thank you for applying for a <strong>${sectorLabel}</strong> role${job_title ? ' (<em>' + job_title + '</em>)' : ''} with Covenant Crest Group Ltd.</p>
+            <p style="font-size:14px;line-height:1.7;color:#333;">Dear <strong>${htmlEsc(first_name)} ${htmlEsc(last_name)}</strong>,</p>
+            <p style="font-size:14px;line-height:1.7;color:#333;">Thank you for applying for a <strong>${htmlEsc(sectorLabel)}</strong> role${job_title ? ' (<em>' + htmlEsc(job_title) + '</em>)' : ''} with Covenant Crest Group Ltd.</p>
             <p style="font-size:14px;line-height:1.7;color:#333;">We have received your application and our recruitment team will review it shortly. If your profile matches our current requirements, a consultant will be in touch within <strong>24–48 hours</strong>.</p>
             <div style="background:#f0f7f0;border-left:3px solid #C9A84C;padding:14px 18px;margin:20px 0;border-radius:0 6px 6px 0;">
               <p style="font-size:13px;color:#333;margin:0;">If your matter is urgent, please call us directly on <a href="tel:07346809846" style="color:#C9A84C;font-weight:600;">07346 809846</a> or email <a href="mailto:recruitment@covenantcrest.co.uk" style="color:#C9A84C;">recruitment@covenantcrest.co.uk</a>.</p>
@@ -433,14 +519,39 @@ const emailTpl = {
           </div>
           <div style="background:#fff;padding:24px;border-radius:0 0 6px 6px;border:1px solid #e0e0e0;">
             <table style="width:100%;border-collapse:collapse;">
-              <tr><td style="padding:8px 0;color:#666;font-size:13px;width:120px;">Name</td><td style="padding:8px 0;font-weight:600;font-size:13px;">${first_name} ${last_name}</td></tr>
-              <tr><td style="padding:8px 0;color:#666;font-size:13px;">Email</td><td style="padding:8px 0;font-size:13px;"><a href="mailto:${email}" style="color:#C9A84C;">${email}</a></td></tr>
-              <tr><td style="padding:8px 0;color:#666;font-size:13px;">Phone</td><td style="padding:8px 0;font-size:13px;">${phone || 'Not provided'}</td></tr>
-              <tr><td style="padding:8px 0;color:#666;font-size:13px;">Sector</td><td style="padding:8px 0;font-size:13px;">${sector || '—'}</td></tr>
-              <tr><td style="padding:8px 0;color:#666;font-size:13px;">Job</td><td style="padding:8px 0;font-size:13px;">${job_title || '—'}</td></tr>
+              <tr><td style="padding:8px 0;color:#666;font-size:13px;width:120px;">Name</td><td style="padding:8px 0;font-weight:600;font-size:13px;">${htmlEsc(first_name)} ${htmlEsc(last_name)}</td></tr>
+              <tr><td style="padding:8px 0;color:#666;font-size:13px;">Email</td><td style="padding:8px 0;font-size:13px;"><a href="mailto:${htmlEsc(email)}" style="color:#C9A84C;">${htmlEsc(email)}</a></td></tr>
+              <tr><td style="padding:8px 0;color:#666;font-size:13px;">Phone</td><td style="padding:8px 0;font-size:13px;">${htmlEsc(phone) || 'Not provided'}</td></tr>
+              <tr><td style="padding:8px 0;color:#666;font-size:13px;">Sector</td><td style="padding:8px 0;font-size:13px;">${htmlEsc(sector) || '—'}</td></tr>
+              <tr><td style="padding:8px 0;color:#666;font-size:13px;">Job</td><td style="padding:8px 0;font-size:13px;">${htmlEsc(job_title) || '—'}</td></tr>
             </table>
             <hr style="margin:16px 0;border:none;border-top:1px solid #eee;">
             <p style="font-size:11px;color:#999;margin:0;">Received: ${new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' })}</p>
+          </div>
+        </div>`,
+    };
+  },
+
+  /* Job alert email — sent to subscriber when a matching new job is posted */
+  jobAlertEmail({ email, job, unsubscribeUrl }) {
+    return {
+      to     : email,
+      subject: `New Job Alert: ${htmlEsc(job.title)} — Covenant Crest`,
+      html   : `
+        <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#f8f8f8;padding:24px;border-radius:8px;">
+          <div style="background:#0D1B2A;padding:20px 24px;border-radius:6px 6px 0 0;text-align:center;">
+            <h2 style="color:#C9A84C;margin:0;font-size:20px;">New Job — Just Posted</h2>
+          </div>
+          <div style="background:#fff;padding:24px;border-radius:0 0 6px 6px;border:1px solid #e0e0e0;">
+            <p style="font-size:14px;color:#333;margin:0 0 6px;">A new job matching your alert has been posted:</p>
+            <div style="background:#f9f6f0;border-left:3px solid #C9A84C;border-radius:0 6px 6px 0;padding:16px 18px;margin:16px 0;">
+              <p style="font-size:18px;font-weight:700;color:#0D1B2A;margin:0 0 6px;">${htmlEsc(job.title)}</p>
+              <p style="font-size:13px;color:#666;margin:0;">📍 ${htmlEsc(job.location || 'UK')} &nbsp;|&nbsp; 💷 ${htmlEsc(job.pay || 'Competitive')} &nbsp;|&nbsp; ${htmlEsc(job.type || 'Full-time')}</p>
+            </div>
+            <a href="https://www.covenantcrest.co.uk/job?id=${job.id}" style="display:inline-block;background:#C9A84C;color:#0D1B2A;font-family:Arial,sans-serif;font-size:12px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;padding:12px 28px;border-radius:4px;text-decoration:none;margin:8px 0 20px;">View &amp; Apply →</a>
+            <hr style="margin:16px 0;border:none;border-top:1px solid #eee;">
+            <p style="font-size:11px;color:#999;margin:0;">You're receiving this because you set up a job alert at covenantcrest.co.uk.<br>
+            <a href="${unsubscribeUrl}" style="color:#C9A84C;">Unsubscribe from job alerts</a></p>
           </div>
         </div>`,
     };
@@ -572,14 +683,16 @@ app.use(cors({
   origin(origin, cb) {
     if (!origin) return cb(null, true);
     const base = (CFG.ALLOWED_ORIGIN || '').replace(/^https?:\/\//, '');
-    if (
-      origin === CFG.ALLOWED_ORIGIN ||
-      origin === 'https://www.' + base ||
-      origin === 'http://www.'  + base ||
-      origin === 'http://localhost:3000' ||
-      origin === 'http://localhost:5500' ||
-      origin === 'http://127.0.0.1:5500'
-    ) return cb(null, true);
+    const allowed = [
+      CFG.ALLOWED_ORIGIN,
+      'https://www.' + base,
+      'http://www.'  + base,
+    ];
+    // Allow localhost only when running locally (not on Render)
+    if (!process.env.RENDER) {
+      allowed.push('http://localhost:3000', 'http://localhost:5500', 'http://127.0.0.1:5500');
+    }
+    if (allowed.includes(origin)) return cb(null, true);
     cb(null, false);
   },
   credentials: true,
@@ -595,9 +708,12 @@ app.use(express.urlencoded({ extended: true, limit: '5mb' }));
 // AUTH MIDDLEWARE
 // ─────────────────────────────────────────────
 function requireAuth(req, res, next) {
-  const auth  = req.headers['authorization'] || '';
-  const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
-  const user  = verifyToken(token);
+  // Prefer httpOnly cookie; fall back to Authorization header for dev/backwards compat
+  const cookies = parseCookies(req);
+  const cookieToken = cookies.cc_session ? decodeURIComponent(cookies.cc_session) : null;
+  const bearerToken = (req.headers['authorization'] || '').startsWith('Bearer ')
+    ? req.headers['authorization'].slice(7) : null;
+  const user = verifyToken(cookieToken) || verifyToken(bearerToken);
   if (!user) return res.status(401).json({ error: 'Unauthorised. Please log in.' });
   req.user = user;
   next();
@@ -669,7 +785,7 @@ async function seedDefaultJobs() {
 if (CFG.MONGODB_URI) {
   seedDefaultJobs();
 }
-console.log('[BOOT] Cloudinary — cloud:', CFG.CLOUDINARY_CLOUD, '| key length:', CFG.CLOUDINARY_KEY.length, '| secret length:', CFG.CLOUDINARY_SECRET.length, '| secret ends with:', CFG.CLOUDINARY_SECRET.slice(-3));
+console.log('[BOOT] Cloudinary — cloud:', CFG.CLOUDINARY_CLOUD, '| key length:', CFG.CLOUDINARY_KEY.length, '| secret configured:', CFG.CLOUDINARY_SECRET.length > 0);
 
 // ─────────────────────────────────────────────
 // ROUTES — HEALTH
@@ -681,8 +797,19 @@ app.get('/', (req, res) => res.json({
   timestamp: new Date().toISOString(),
 }));
 
-app.get('/health',     (req, res) => res.json({ status: 'healthy', uptime: process.uptime(), databaseConnected: mongoose.connection.readyState === 1, resendConfigured: !!CFG.RESEND_API_KEY, hubspotConfigured: !!CFG.HUBSPOT_ACCESS_TOKEN, microsoftSSOConfigured: !!(CFG.MICROSOFT_CLIENT_ID && CFG.MICROSOFT_CLIENT_SECRET) }));
-app.get('/api/health', (req, res) => res.json({ status: 'healthy', uptime: process.uptime(), databaseConnected: mongoose.connection.readyState === 1, resendConfigured: !!CFG.RESEND_API_KEY, hubspotConfigured: !!CFG.HUBSPOT_ACCESS_TOKEN, microsoftSSOConfigured: !!(CFG.MICROSOFT_CLIENT_ID && CFG.MICROSOFT_CLIENT_SECRET) }));
+function healthPayload() {
+  return {
+    status: 'healthy',
+    uptime: Math.floor(process.uptime()),
+    db: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
+    databaseConnected:       mongoose.connection.readyState === 1,
+    hubspotConfigured:       !!CFG.HUBSPOT_ACCESS_TOKEN,
+    resendConfigured:        !!CFG.RESEND_API_KEY,
+    microsoftSSOConfigured:  !!(CFG.MICROSOFT_CLIENT_ID && CFG.MICROSOFT_CLIENT_SECRET),
+  };
+}
+app.get('/health',     (req, res) => res.json(healthPayload()));
+app.get('/api/health', (req, res) => res.json(healthPayload()));
 
 // ─────────────────────────────────────────────
 // ROUTES — AUTH
@@ -717,11 +844,9 @@ app.post('/api/auth/login', rateLimit(15 * 60 * 1000, 5), async (req, res) => {
         match = (password === CFG.SUPER_ADMIN_PWD);
       }
       if (match) {
-        return res.json({
-          token: makeToken({ email: emailLc, role: 'superadmin' }),
-          role : 'superadmin',
-          email: emailLc,
-        });
+        const token = makeToken({ email: emailLc, role: 'superadmin' });
+        setSessionCookie(res, token);
+        return res.json({ role: 'superadmin', email: emailLc });
       }
       // Log failed attempt
       logSecurityEvent('failed_login', emailLc, req, { role: 'superadmin' });
@@ -729,9 +854,8 @@ app.post('/api/auth/login', rateLimit(15 * 60 * 1000, 5), async (req, res) => {
       return res.status(401).json({ error: 'Invalid email or password.' });
     }
 
-    // ── Employee accounts ─────────────────────────────────────────
-    const users = readJSON(FILES.users);
-    const user  = users.find(u => (u.email || '').toLowerCase() === emailLc);
+    // ── Employee accounts (MongoDB) ───────────────────────────────
+    const user = await User.findOne({ email: emailLc });
     if (user && user.role === 'employee') {
       let match = false;
       try {
@@ -740,11 +864,9 @@ app.post('/api/auth/login', rateLimit(15 * 60 * 1000, 5), async (req, res) => {
         match = (password === user.password);
       }
       if (match) {
-        return res.json({
-          token: makeToken({ email: user.email, role: 'employee', id: user.id }),
-          role : 'employee',
-          email: user.email,
-        });
+        const token = makeToken({ email: user.email, role: 'employee', id: user.id });
+        setSessionCookie(res, token);
+        return res.json({ role: 'employee', email: user.email });
       }
     }
 
@@ -807,10 +929,45 @@ app.get('/api/auth/me', requireAuth, (req, res) => {
 });
 
 /**
+ * POST /api/auth/exchange-sso-code
+ * Body: { code }
+ * Exchanges the one-time SSO code for an httpOnly session cookie.
+ * Code expires after 90 seconds and is deleted on first use.
+ */
+app.post('/api/auth/exchange-sso-code', (req, res) => {
+  const { code } = req.body || {};
+  if (!code) return res.status(400).json({ error: 'Code is required.' });
+
+  const data = ssoCodeStore.get(code);
+  if (!data || data.expires < Date.now()) {
+    ssoCodeStore.delete(code);
+    return res.status(401).json({ error: 'Invalid or expired SSO code. Please sign in again.' });
+  }
+
+  // Single use — delete immediately after reading
+  ssoCodeStore.delete(code);
+
+  setSessionCookie(res, data.token);
+  res.json({ role: data.role, email: data.email });
+});
+
+/**
+ * POST /api/auth/logout
+ * Clears the session cookie.
+ */
+app.post('/api/auth/logout', (req, res) => {
+  clearSessionCookie(res);
+  res.json({ success: true });
+});
+
+/**
  * GET /api/security-logs — Super Admin only
  */
-app.get('/api/security-logs', requireSuperAdmin, (req, res) => {
-  res.json(readJSON(FILES.security));
+app.get('/api/security-logs', requireSuperAdmin, async (req, res) => {
+  try {
+    const logs = await SecurityLog.find().sort({ timestamp: -1 }).limit(200);
+    res.json(logs);
+  } catch(e) { res.status(500).json({ error: 'Failed to fetch security logs' }); }
 });
 
 // ─────────────────────────────────────────────
@@ -918,10 +1075,12 @@ app.get('/api/auth/microsoft-callback', async (req, res) => {
       return res.redirect('/login.html?error=microsoft_unauthorised');
     }
 
-    // 4. Issue JWT token & redirect to Admin Panel via fragment hash
+    // 4. Issue JWT, store as one-time code, redirect safely (no token in URL)
     const token = makeToken({ email: userEmail, role: 'superadmin' });
+    const code  = crypto.randomBytes(32).toString('hex');
+    ssoCodeStore.set(code, { token, email: userEmail, role: 'superadmin', expires: Date.now() + 90000 });
     logSecurityEvent('sso_login', userEmail, req, { provider: 'microsoft' });
-    res.redirect('/admin.html#sso=' + token);
+    res.redirect('/admin?code=' + code);
 
   } catch (err) {
     console.error('[microsoft-sso] OAuth Callback processing failed:', err.message);
@@ -940,7 +1099,7 @@ app.get('/api/jobs', async (req, res) => {
     const { sector, type, location } = req.query;
     if (sector)   query.sector = sector;
     if (type)     query.type   = type;
-    if (location) query.location = { $regex: location, $options: 'i' };
+    if (location) query.location = { $regex: location.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' };
 
     const jobs = await Job.find(query).sort({ createdAt: -1 });
     res.json(jobs);
@@ -994,6 +1153,22 @@ app.post('/api/jobs', requireAuth, async (req, res) => {
       seoDesc,
     });
     await job.save();
+
+    // ── Fire job alerts (non-blocking) ────────────────────────────
+    if (job.status === 'active') {
+      JobAlert.find().then(alerts => {
+        const matching = alerts.filter(a =>
+          !a.sectors || a.sectors.length === 0 || a.sectors.includes(job.sector)
+        );
+        matching.forEach(alert => {
+          const unsubUrl = `https://www.covenantcrest.co.uk/api/job-alerts/unsubscribe/${alert.token}`;
+          sendEmail(emailTpl.jobAlertEmail({ email: alert.email, job, unsubscribeUrl: unsubUrl }))
+            .catch(e => console.error('[JobAlert] Email failed for', alert.email, e.message));
+        });
+        if (matching.length) console.log(`[JobAlert] Fired ${matching.length} alert emails for new job: ${job.title}`);
+      }).catch(e => console.error('[JobAlert] Failed to fetch alerts:', e.message));
+    }
+
     res.status(201).json(job);
   } catch(e) { res.status(500).json({ error: 'Failed to create job' }); }
 });
@@ -1046,13 +1221,14 @@ app.get('/api/contacts', requireAuth, async (req, res) => {
  * Used by website forms OR Netlify webhook forwarding
  * Sends email alert + auto-reply
  */
-app.post('/api/contacts', async (req, res) => {
+app.post('/api/contacts', rateLimit(15 * 60 * 1000, 10), async (req, res) => {
   try {
     const contact = new Contact({
       id     : uid(),
       name   : sanitise(req.body.name || req.body.first_name || '', 120),
       email  : sanitise(req.body.email || '', 200),
       phone  : sanitise(req.body.phone || '', 30),
+      company: sanitise(req.body.company || '', 200), // Bug 7: Extract structured company field
       type   : sanitise(req.body.enquiry_type || req.body.type || 'general', 40),
       message: sanitise(req.body.message || req.body.notes || '', 3000),
       source : sanitise(req.body['form-name'] || 'api', 50),
@@ -1103,8 +1279,101 @@ app.delete('/api/contacts/:id', requireSuperAdmin, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
-// ROUTES — CANDIDATE APPLICATIONS
+// ROUTES — JOB ALERTS
 // ─────────────────────────────────────────────
+
+/**
+ * POST /api/job-alerts — public
+ * Body: { email, sectors: ['care','security',...] }
+ * Subscribes an email to job alerts. Sectors is optional ([] = all).
+ */
+app.post('/api/job-alerts', rateLimit(60 * 60 * 1000, 5), async (req, res) => {
+  const email   = sanitise(req.body.email || '', 200).toLowerCase();
+  const sectors = Array.isArray(req.body.sectors)
+    ? req.body.sectors.map(s => sanitise(String(s), 30)).filter(Boolean)
+    : [];
+
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ error: 'A valid email address is required.' });
+  }
+
+  try {
+    // Upsert — update sectors if email already subscribed
+    const existing = await JobAlert.findOne({ email });
+    if (existing) {
+      existing.sectors = sectors;
+      await existing.save();
+      return res.json({ success: true, message: 'Your job alert preferences have been updated.' });
+    }
+
+    const alert = new JobAlert({
+      id     : uid(),
+      email,
+      sectors,
+      token  : crypto.randomBytes(32).toString('hex'),
+    });
+    await alert.save();
+
+    // Send confirmation email (non-blocking)
+    sendEmail({
+      to     : email,
+      subject: 'Job Alert Confirmed — Covenant Crest',
+      html   : `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#f8f8f8;padding:24px;border-radius:8px;">
+        <div style="background:#0D1B2A;padding:20px 24px;border-radius:6px 6px 0 0;text-align:center;">
+          <h2 style="color:#C9A84C;margin:0;font-size:20px;">Job Alert Set ✓</h2>
+        </div>
+        <div style="background:#fff;padding:24px;border-radius:0 0 6px 6px;border:1px solid #e0e0e0;">
+          <p style="font-size:14px;color:#333;line-height:1.7;">You're now signed up for job alerts${sectors.length ? ' in: <strong>' + sectors.join(', ') + '</strong>' : ' across all sectors'}.</p>
+          <p style="font-size:14px;color:#333;line-height:1.7;">We'll email you as soon as a matching job is posted. In the meantime, browse our <a href="https://www.covenantcrest.co.uk/recruitment" style="color:#C9A84C;">live job listings</a>.</p>
+          <hr style="margin:16px 0;border:none;border-top:1px solid #eee;">
+          <p style="font-size:11px;color:#999;margin:0;">Not you? <a href="https://www.covenantcrest.co.uk/api/job-alerts/unsubscribe/${alert.token}" style="color:#C9A84C;">Unsubscribe immediately</a>.</p>
+        </div>
+      </div>`,
+    }).catch(e => console.error('[JobAlert] Confirmation email failed:', e.message));
+
+    res.status(201).json({ success: true, message: 'Job alert created! Check your email for confirmation.' });
+  } catch(e) {
+    console.error('[JobAlert] Save failed:', e.message);
+    res.status(500).json({ error: 'Failed to save job alert.' });
+  }
+});
+
+/**
+ * GET /api/job-alerts/unsubscribe/:token — public one-click unsubscribe
+ */
+app.get('/api/job-alerts/unsubscribe/:token', async (req, res) => {
+  try {
+    const result = await JobAlert.deleteOne({ token: req.params.token });
+    if (result.deletedCount === 0) {
+      return res.send('<html><body style="font-family:Arial;text-align:center;padding:80px;background:#f8f8f8;"><h2 style="color:#C9A84C;">Alert not found</h2><p>This unsubscribe link may have already been used.</p><a href="https://www.covenantcrest.co.uk/recruitment">Browse Jobs</a></body></html>');
+    }
+    res.send('<html><body style="font-family:Arial;text-align:center;padding:80px;background:#f8f8f8;"><h2 style="color:#0D1B2A;">Unsubscribed ✓</h2><p style="color:#555;">You\'ve been removed from job alerts. You won\'t receive any more emails from us.</p><p><a href="https://www.covenantcrest.co.uk/recruitment" style="color:#C9A84C;">Browse current jobs</a></p></body></html>');
+  } catch(e) {
+    res.status(500).send('Error processing unsubscribe. Please contact info@covenantcrest.co.uk');
+  }
+});
+
+/**
+ * GET /api/job-alerts — admin view of all subscribers
+ */
+app.get('/api/job-alerts', requireSuperAdmin, async (req, res) => {
+  try {
+    const alerts = await JobAlert.find().sort({ createdAt: -1 }).select('-token');
+    res.json(alerts);
+  } catch(e) { res.status(500).json({ error: 'Failed to fetch job alerts' }); }
+});
+
+/**
+ * DELETE /api/job-alerts/:id — super admin remove subscriber
+ */
+app.delete('/api/job-alerts/:id', requireSuperAdmin, async (req, res) => {
+  try {
+    await JobAlert.deleteOne({ id: req.params.id });
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: 'Failed to delete alert' }); }
+});
+
+
 
 /** GET /api/applications/all — protected */
 app.get('/api/applications/all', requireAuth, async (req, res) => {
@@ -1123,19 +1392,41 @@ app.get('/api/applications', requireSuperAdmin, async (req, res) => {
 });
 
 /** POST /api/applications — public */
-app.post('/api/applications', async (req, res) => {
+app.post('/api/applications', rateLimit(15 * 60 * 1000, 5), async (req, res) => {
   try {
-    const { cvBase64, cvFileName, ...rest } = req.body;
+    const b = req.body;
+    const cvBase64   = b.cvBase64   || null;
+    const cvFileName = b.cvFileName || null;
+
+    // Whitelist every field a candidate is allowed to submit — nothing else gets into the DB
+    const safe = {
+      first_name   : sanitise(b.first_name,    80),
+      last_name    : sanitise(b.last_name,     80),
+      email        : sanitise(b.email,         200),
+      phone        : sanitise(b.phone,         30),
+      sector       : sanitise(b.sector,        40),
+      job_title    : sanitise(b.job_title,     120),
+      availability : sanitise(b.availability,  40),
+      notes        : sanitise(b.notes,         1000),
+      rtw_status   : sanitise(b.rtw_status,    40),
+      visa_details : sanitise(b.visa_details,  200),
+      is_veteran   : sanitise(b.is_veteran,    10),
+      assistance   : sanitise(b.assistance,    300),
+      // Dynamic Vetting whitelists (Bug 11 backend mapping)
+      dbs_cert_number    : sanitise(b.dbs_cert_number, 50),
+      sia_licence_number : sanitise(b.sia_licence_number, 50),
+      sia_expiry_date    : sanitise(b.sia_expiry_date, 30),
+    };
 
     // 1. Enforce Blacklist
     const isBlacklisted = await Application.exists({
-      email: rest.email,
+      email: safe.email,
       status: 'blacklisted'
     });
 
     const entry = new Application({
       id: uid(),
-      ...rest,
+      ...safe,
       status: isBlacklisted ? 'blacklisted' : 'new',
     });
 
@@ -1243,12 +1534,14 @@ app.post('/api/upload', requireAuth, async (req, res) => {
 // ─────────────────────────────────────────────
 
 /** GET /api/users */
-app.get('/api/users', requireSuperAdmin, (req, res) => {
-  const users = readJSON(FILES.users).map(({ id, email, role, created }) => ({ id, email, role, created }));
-  res.json([
-    { id: 'superadmin', email: CFG.SUPER_ADMIN_EMAIL, role: 'superadmin', created: null },
-    ...users,
-  ]);
+app.get('/api/users', requireSuperAdmin, async (req, res) => {
+  try {
+    const users = await User.find({ role: 'employee' }).select('-password').sort({ createdAt: 1 });
+    res.json([
+      { id: 'superadmin', email: CFG.SUPER_ADMIN_EMAIL, role: 'superadmin', created: null },
+      ...users.map(u => ({ id: u.id, email: u.email, role: u.role, created: u.created })),
+    ]);
+  } catch(e) { res.status(500).json({ error: 'Failed to fetch users' }); }
 });
 
 /** POST /api/users — create employee */
@@ -1261,34 +1554,35 @@ app.post('/api/users', requireSuperAdmin, async (req, res) => {
   if (emailLc === CFG.SUPER_ADMIN_EMAIL.toLowerCase())
     return res.status(409).json({ error: 'This email is reserved.' });
 
-  const users = readJSON(FILES.users);
-  if (users.find(u => (u.email || '').toLowerCase() === emailLc))
-    return res.status(409).json({ error: 'An account with this email already exists.' });
+  try {
+    const existing = await User.findOne({ email: emailLc });
+    if (existing) return res.status(409).json({ error: 'An account with this email already exists.' });
 
-  const hashed = await hashPassword(password);
-  const user = {
-    id      : uid(),
-    email   : emailLc,
-    password: hashed,
-    role    : 'employee',
-    created : new Date().toISOString(),
-  };
-  users.push(user);
-  writeJSON(FILES.users, users);
-
-  const { password: _, ...safe } = user;
-  res.status(201).json(safe);
+    const hashed = await hashPassword(password);
+    const user = new User({
+      id      : uid(),
+      email   : emailLc,
+      password: hashed,
+      role    : 'employee',
+      created : new Date(),
+    });
+    await user.save();
+    res.status(201).json({ id: user.id, email: user.email, role: user.role, created: user.created });
+  } catch(e) {
+    if (e.code === 11000) return res.status(409).json({ error: 'An account with this email already exists.' });
+    res.status(500).json({ error: 'Failed to create user' });
+  }
 });
 
 /** DELETE /api/users/:id */
-app.delete('/api/users/:id', requireSuperAdmin, (req, res) => {
+app.delete('/api/users/:id', requireSuperAdmin, async (req, res) => {
   if (req.params.id === 'superadmin')
     return res.status(403).json({ error: 'Cannot delete the Super Admin account.' });
-  const users    = readJSON(FILES.users);
-  const filtered = users.filter(u => u.id !== req.params.id);
-  if (filtered.length === users.length) return res.status(404).json({ error: 'User not found.' });
-  writeJSON(FILES.users, filtered);
-  res.json({ success: true });
+  try {
+    const result = await User.deleteOne({ id: req.params.id });
+    if (result.deletedCount === 0) return res.status(404).json({ error: 'User not found.' });
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: 'Failed to delete user' }); }
 });
 
 // ─────────────────────────────────────────────
@@ -1307,7 +1601,9 @@ app.post('/api/netlify-webhook', async (req, res) => {
     const sig      = req.headers['x-webhook-signature'] || '';
     const rawBody  = req.rawBody || Buffer.from(JSON.stringify(req.body));
     const expected = crypto.createHmac('sha256', CFG.NETLIFY_SECRET).update(rawBody).digest('hex');
-    if (sig !== `sha256=${expected}`) {
+    
+    const expectedSig = `sha256=${expected}`;
+    if (sig.length !== expectedSig.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expectedSig))) {
       return res.status(401).json({ error: 'Invalid webhook signature.' });
     }
   }
@@ -1349,9 +1645,10 @@ app.post('/api/netlify-webhook', async (req, res) => {
   // ── All other forms → Contact Enquiries ──────────────────────
   const contact = new Contact({
     id     : uid(),
-    name   : sanitise(data.name || data.first_name || '', 120),
+    name   : sanitise(data.full_name || data.name || data.first_name || '', 120), // Bug 6: Support full_name from webhook
     email  : sanitise(data.email || '', 200),
     phone  : sanitise(data.phone || '', 30),
+    company: sanitise(data.company || '', 200), // Bug 7: Support B2B company in webhook
     type   : sanitise(data.enquiry_type || data.type || formName || 'general', 40),
     message: sanitise(data.message || data.notes || '', 3000),
     source : sanitise(formName || 'netlify-webhook', 50),
@@ -1827,7 +2124,7 @@ app.listen(PORT, () => {
   console.log(`   CRM Engine    : ${CFG.HUBSPOT_ACCESS_TOKEN ? '✅ HubSpot API v3 CRM Active' : '⚠️  HUBSPOT_ACCESS_TOKEN not set'}`);
   console.log(`   Mail Engine   : ${CFG.RESEND_API_KEY ? '✅ Resend Outbound Service Active' : '⚠️  RESEND_API_KEY not set'}`);
   console.log(`   Microsoft SSO : ${CFG.MICROSOFT_CLIENT_ID ? '✅ Azure AD SSO Configured' : '⚠️  MICROSOFT_CLIENT_ID not set'}`);
-  console.log(`   Cloudinary    : ${CFG.CLOUDINARY_KEY  ? '✅ Assets CDN Configured' : '⚠️  credentials not set'}`);
+console.log(`   Cloudinary    : ${CFG.CLOUDINARY_KEY  ? '✅ Assets CDN Configured' : '⚠️  credentials not set'}`);
   console.log('\n📋 Active Premium Endpoints:');
   [
     'GET    /api/jobs                — public job listings',
