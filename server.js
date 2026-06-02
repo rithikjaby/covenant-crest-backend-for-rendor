@@ -1914,7 +1914,7 @@ app.post('/api/interviews/schedule-teams', requireAuth, async (req, res) => {
     const startDateTime = new Date(dateTime);
     const endDateTime = new Date(startDateTime.getTime() + duration * 60 * 1000);
 
-    const organiserEmail = CFG.SUPER_ADMIN_EMAIL.toLowerCase();
+    const organiserEmail = 'recruitment@covenantcrest.co.uk';
 
     // Fallback sandbox / diagnostic mode if Microsoft SSO Client ID is not configured
     if (!CFG.MICROSOFT_CLIENT_ID || !CFG.MICROSOFT_CLIENT_SECRET) {
@@ -1949,9 +1949,10 @@ app.post('/api/interviews/schedule-teams', requireAuth, async (req, res) => {
       `;
 
       await sendEmail({
-        to: candidateEmail,
+        to: [candidateEmail, CFG.SUPER_ADMIN_EMAIL.toLowerCase()],
         subject: `Interview Scheduled: ${jobTitle || 'Covenant Crest Role'} — Covenant Crest Group`,
-        html: emailHtml
+        html: emailHtml,
+        from: 'recruitment@covenantcrest.co.uk'
       }).catch(e => console.error('[M365 Sandbox] Invite Email dispatch failed:', e.message));
 
       return res.json({
@@ -1988,6 +1989,13 @@ app.post('/api/interviews/schedule-teams', requireAuth, async (req, res) => {
           emailAddress: {
             address: candidateEmail,
             name: candidateName
+          },
+          type: 'required'
+        },
+        {
+          emailAddress: {
+            address: CFG.SUPER_ADMIN_EMAIL.toLowerCase(),
+            name: 'Jaby K'
           },
           type: 'required'
         }
