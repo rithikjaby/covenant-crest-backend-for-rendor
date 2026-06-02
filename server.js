@@ -1077,10 +1077,10 @@ app.get('/api/auth/microsoft-callback', async (req, res) => {
 
     // 4. Issue JWT, store as one-time code, redirect safely (no token in URL)
     const token = makeToken({ email: userEmail, role: 'superadmin' });
-    const code  = crypto.randomBytes(32).toString('hex');
-    ssoCodeStore.set(code, { token, email: userEmail, role: 'superadmin', expires: Date.now() + 90000 });
+    const ssoCode = crypto.randomBytes(32).toString('hex');
+    ssoCodeStore.set(ssoCode, { token, email: userEmail, role: 'superadmin', expires: Date.now() + 90000 });
     logSecurityEvent('sso_login', userEmail, req, { provider: 'microsoft' });
-    res.redirect('/admin?code=' + code);
+    res.redirect('/admin?code=' + ssoCode);
 
   } catch (err) {
     console.error('[microsoft-sso] OAuth Callback processing failed:', err.message);
