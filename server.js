@@ -1162,7 +1162,7 @@ app.post('/api/jobs', requireAuth, async (req, res) => {
         );
         matching.forEach(alert => {
           const unsubUrl = `https://www.covenantcrest.co.uk/api/job-alerts/unsubscribe/${alert.token}`;
-          sendEmail(emailTpl.jobAlertEmail({ email: alert.email, job, unsubscribeUrl: unsubUrl }))
+          sendEmail({ ...emailTpl.jobAlertEmail({ email: alert.email, job, unsubscribeUrl: unsubUrl }), from: 'recruitment@covenantcrest.co.uk' })
             .catch(e => console.error('[JobAlert] Email failed for', alert.email, e.message));
         });
         if (matching.length) console.log(`[JobAlert] Fired ${matching.length} alert emails for new job: ${job.title}`);
@@ -1236,15 +1236,22 @@ app.post('/api/contacts', rateLimit(15 * 60 * 1000, 10), async (req, res) => {
     });
     await contact.save();
 
-  // Fire emails + CRM Sync (non-blocking)
-  Promise.allSettled([
-    sendEmail(emailTpl.newEnquiryAlert(contact)),
-    contact.email ? sendEmail({
-      ...emailTpl.enquiryAutoReply(contact),
-      to: contact.email,
-    }) : Promise.resolve(),
-    syncToHubSpot(contact, 'contact').catch(e => console.error('[HubSpot] Contact CRM Sync failed:', e.message))
-  ]).then(results => {
+    // Determine dynamic sender email based on enquiry type
+    let fromEmail = CFG.EMAIL_FROM;
+    if (contact.type === 'haulage') fromEmail = 'haulage@covenantcrest.co.uk';
+    else if (contact.type === 'trade') fromEmail = 'trade@covenantcrest.co.uk';
+    else if (contact.type === 'general' || contact.type === 'contact' || contact.type === 'about') fromEmail = 'info@covenantcrest.co.uk';
+
+    // Fire emails + CRM Sync (non-blocking)
+    Promise.allSettled([
+      sendEmail(emailTpl.newEnquiryAlert(contact)),
+      contact.email ? sendEmail({
+        ...emailTpl.enquiryAutoReply(contact),
+        to: contact.email,
+        from: fromEmail,
+      }) : Promise.resolve(),
+      syncToHubSpot(contact, 'contact').catch(e => console.error('[HubSpot] Contact CRM Sync failed:', e.message))
+    ]).then(results => {
     results.forEach((r, i) => {
       if (r.status === 'rejected') console.error('Email/CRM error #' + i, r.reason?.message);
     });
@@ -1329,6 +1336,7 @@ app.post('/api/job-alerts', rateLimit(60 * 60 * 1000, 5), async (req, res) => {
           <p style="font-size:11px;color:#999;margin:0;">Not you? <a href="https://www.covenantcrest.co.uk/api/job-alerts/unsubscribe/${alert.token}" style="color:#C9A84C;">Unsubscribe immediately</a>.</p>
         </div>
       </div>`,
+      from   : 'recruitment@covenantcrest.co.uk',
     }).catch(e => console.error('[JobAlert] Confirmation email failed:', e.message));
 
     res.status(201).json({ success: true, message: 'Job alert created! Check your email for confirmation.' });
@@ -1448,7 +1456,7 @@ app.post('/api/applications', rateLimit(15 * 60 * 1000, 5), async (req, res) => 
     // Non-blocking emails + CRM Sync
     Promise.allSettled([
       sendEmail(emailTpl.newApplicationAlert(entry)),
-      entry.email ? sendEmail({ ...emailTpl.applicationAutoReply(entry), to: entry.email }) : Promise.resolve(),
+      entry.email ? sendEmail({ ...emailTpl.applicationAutoReply(entry), to: entry.email, from: 'recruitment@covenantcrest.co.uk' }) : Promise.resolve(),
       syncToHubSpot(entry, 'candidate').catch(e => console.error('[HubSpot] Candidate CRM Sync failed:', e.message))
     ]);
 
@@ -1635,7 +1643,7 @@ app.post('/api/netlify-webhook', async (req, res) => {
     // Alert to admin + confirmation to candidate + HubSpot CRM sync
     Promise.allSettled([
       sendEmail(emailTpl.newApplicationAlert(entry)),
-      entry.email ? sendEmail({ ...emailTpl.applicationAutoReply(entry), to: entry.email }) : Promise.resolve(),
+      entry.email ? sendEmail({ ...emailTpl.applicationAutoReply(entry), to: entry.email, from: 'recruitment@covenantcrest.co.uk' }) : Promise.resolve(),
       syncToHubSpot(entry, 'candidate').catch(e => console.error('[HubSpot] Webhook Candidate CRM Sync failed:', e.message))
     ]);
 
@@ -1656,9 +1664,16 @@ app.post('/api/netlify-webhook', async (req, res) => {
   });
   await contact.save();
 
+  // Determine dynamic sender email based on enquiry type or form name
+  let fromEmail = CFG.EMAIL_FROM;
+  if (contact.type === 'haulage' || formName === 'haulage-quote') fromEmail = 'haulage@covenantcrest.co.uk';
+  else if (contact.type === 'trade' || formName === 'trade-enquiry') fromEmail = 'trade@covenantcrest.co.uk';
+  else if (contact.type === 'general' || contact.type === 'contact' || contact.type === 'about_enquiry') fromEmail = 'info@covenantcrest.co.uk';
+  else if (formName === 'recruitment-request-staff') fromEmail = 'recruitment@covenantcrest.co.uk';
+
   Promise.allSettled([
     sendEmail(emailTpl.newEnquiryAlert(contact)),
-    contact.email ? sendEmail({ ...emailTpl.enquiryAutoReply(contact), to: contact.email }) : Promise.resolve(),
+    contact.email ? sendEmail({ ...emailTpl.enquiryAutoReply(contact), to: contact.email, from: fromEmail }) : Promise.resolve(),
     syncToHubSpot(contact, 'contact').catch(e => console.error('[HubSpot] Webhook Contact CRM Sync failed:', e.message))
   ]);
 
@@ -1746,15 +1761,16 @@ async function syncToHubSpot(data, type) {
  * Direct email dispatcher utilizing the Resend API to deliver alerts
  * straight to your corporate Outlook inbox.
  */
-async function sendEmail({ to, subject, html }) {
+async function sendEmail({ to, subject, html, from }) {
   if (!CFG.RESEND_API_KEY) {
     console.warn('[email] Resend API Key is not set. Outbound mail was bypassed:', subject);
     return Promise.resolve({ bypassed: true });
   }
 
+  const fromAddress = from || CFG.EMAIL_FROM;
   const recipients = Array.isArray(to) ? to : [to];
   const body = JSON.stringify({
-    from   : `Covenant Crest <${CFG.EMAIL_FROM}>`,
+    from   : `Covenant Crest <${fromAddress}>`,
     to     : recipients,
     subject,
     html,
