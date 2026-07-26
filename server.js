@@ -92,6 +92,7 @@ const CFG = {
   SUPER_ADMIN_PWD   : process.env._SAVED_ADMIN_PW || process.env.SUPER_ADMIN_PWD || (() => { console.error('\n⚠️  CRITICAL: SUPER_ADMIN_PWD env var is not set. Using insecure default. Set SUPER_ADMIN_PWD in Render → Environment immediately.\n'); return 'ChangeMe2025!'; })(),
   JWT_SECRET        : process.env.JWT_SECRET        || (() => { console.error('\n⚠️  CRITICAL: JWT_SECRET env var is not set. Sessions will be invalidated on every restart. Set JWT_SECRET in Render → Environment.\n'); return crypto.randomBytes(32).toString('hex'); })(),
   ALLOWED_ORIGIN    : process.env.ALLOWED_ORIGIN    || 'https://covenantcrest.co.uk',
+  SUPER_ADMIN_2FA_SECRET: process.env.SUPER_ADMIN_2FA_SECRET || '',
 
   // Email (Resend)
   RESEND_API_KEY    : process.env.RESEND_API_KEY    || '',
@@ -219,6 +220,16 @@ const AppSchema = new mongoose.Schema({
   compliance_status: { type: String, default: 'incomplete' },
   source: String,
   rating: Number,
+  // Extracted and mapped from frontend forms
+  postcode: String,
+  rtw_status: String,
+  visa_details: String,
+  is_veteran: String,
+  assistance: String,
+  nmc_pin: String,
+  cscs_number: String,
+  food_hygiene_level: String,
+  hgv_license: String,
   date: { type: Date, default: Date.now }
 }, { timestamps: true });
 
@@ -424,6 +435,49 @@ function verifyToken(token) {
     if (payload.exp < Math.floor(Date.now() / 1000)) return null;
     return payload;
   } catch { return null; }
+}
+
+// Native TOTP verification helper (Microsoft/Google Authenticator compatible)
+function verifyTOTP(token, secret) {
+  if (!token || !secret) return false;
+  token = String(token).replace(/\s+/g, '');
+  if (!/^\d{6}$/.test(token)) return false;
+
+  const base32chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  let bits = '';
+  const cleanSecret = secret.toUpperCase().replace(/\s+/g, '');
+  for (let i = 0; i < cleanSecret.length; i++) {
+    const val = base32chars.indexOf(cleanSecret.charAt(i));
+    if (val === -1) continue;
+    bits += val.toString(2).padStart(5, '0');
+  }
+  
+  const keyBytes = [];
+  for (let i = 0; i + 8 <= bits.length; i += 8) {
+    keyBytes.push(parseInt(bits.substr(i, 8), 2));
+  }
+  const key = Buffer.from(keyBytes);
+
+  const timeStep = 30;
+  const currentStep = Math.floor(Date.now() / 1000 / timeStep);
+
+  for (let stepOffset = -1; stepOffset <= 1; stepOffset++) {
+    const step = currentStep + stepOffset;
+    const buf = Buffer.alloc(8);
+    buf.writeUInt32BE(Math.floor(step / 0x100000000), 0);
+    buf.writeUInt32BE(step % 0x100000000, 4);
+
+    const hmac = crypto.createHmac('sha1', key).update(buf).digest();
+    const offset = hmac[hmac.length - 1] & 0xf;
+    const code = ((hmac[offset] & 0x7f) << 24) |
+                 ((hmac[offset + 1] & 0xff) << 16) |
+                 ((hmac[offset + 2] & 0xff) << 8) |
+                 (hmac[offset + 3] & 0xff);
+
+    const checkToken = String(code % 1000000).padStart(6, '0');
+    if (checkToken === token) return true;
+  }
+  return false;
 }
 
 
@@ -821,7 +875,7 @@ app.get('/api/health', (req, res) => res.json(healthPayload()));
  * Returns: { token, role, email }
  */
 app.post('/api/auth/login', rateLimit(15 * 60 * 1000, 5), async (req, res) => {
-  const { email = '', password = '', honeypot = '' } = req.body;
+  const { email = '', password = '', honeypot = '', otp = '' } = req.body;
   const emailLc = email.trim().toLowerCase();
 
   // Honeypot check for bots
@@ -844,6 +898,18 @@ app.post('/api/auth/login', rateLimit(15 * 60 * 1000, 5), async (req, res) => {
         match = (password === CFG.SUPER_ADMIN_PWD);
       }
       if (match) {
+        // Enforce 2FA verification step if secret is configured on Render
+        if (CFG.SUPER_ADMIN_2FA_SECRET) {
+          if (!otp) {
+            return res.status(202).json({ twoFactorRequired: true, message: '2FA verification code required.' });
+          }
+          const verified = verifyTOTP(otp, CFG.SUPER_ADMIN_2FA_SECRET);
+          if (!verified) {
+            logSecurityEvent('failed_2fa', emailLc, req, { role: 'superadmin' });
+            return res.status(401).json({ error: 'Invalid 2FA authentication code.' });
+          }
+        }
+
         const token = makeToken({ email: emailLc, role: 'superadmin' });
         setSessionCookie(res, token);
         return res.json({ role: 'superadmin', email: emailLc });
@@ -1420,10 +1486,16 @@ app.post('/api/applications', rateLimit(15 * 60 * 1000, 5), async (req, res) => 
       visa_details : sanitise(b.visa_details,  200),
       is_veteran   : sanitise(b.is_veteran,    10),
       assistance   : sanitise(b.assistance,    300),
+      postcode     : sanitise(b.postcode,      20),
       // Dynamic Vetting whitelists (Bug 11 backend mapping)
       dbs_cert_number    : sanitise(b.dbs_cert_number, 50),
       sia_licence_number : sanitise(b.sia_licence_number, 50),
       sia_expiry_date    : sanitise(b.sia_expiry_date, 30),
+      // Sector compliance fields
+      nmc_pin            : sanitise(b.nmc_pin, 50),
+      cscs_number        : sanitise(b.cscs_number, 50),
+      food_hygiene_level : sanitise(b.food_hygiene_level || b.hygiene_cert, 100),
+      hgv_license        : sanitise(b.hgv_license || b.hgv_number, 100),
     };
 
     // 1. Enforce Blacklist
@@ -1469,7 +1541,12 @@ app.put('/api/applications/:id', requireAuth, async (req, res) => {
   try {
     const allowed = [
       'status', 'notes', 'adminNotes', 'matchScore', 'rating',
-      'dbs_expiry_date', 'sia_expiry_date', 'rtw_expiry_date', 'manual_handling_cert',
+      'dbs_level', 'dbs_cert_number', 'dbs_expiry_date',
+      'sia_licence_number', 'sia_expiry_date',
+      'rtw_doc_type', 'rtw_expiry_date', 'rtw_verified',
+      'manual_handling_cert', 'compliance_notes', 'compliance_status',
+      'postcode', 'rtw_status', 'visa_details', 'is_veteran', 'assistance',
+      'nmc_pin', 'cscs_number', 'food_hygiene_level', 'hgv_license'
     ];
     const update = {};
     for (const key of allowed) {
@@ -1479,10 +1556,58 @@ app.put('/api/applications/:id', requireAuth, async (req, res) => {
           : req.body[key];
       }
     }
-    const app = await Application.findOneAndUpdate({ id: req.params.id }, update, { new: true });
-    if (!app) return res.status(404).json({ error: 'Application not found.' });
-    res.json(app);
-  } catch(e) { res.status(500).json({ error: 'Failed to update application' }); }
+    
+    // Find candidate first to track status transitions
+    const appDoc = await Application.findOne({ id: req.params.id });
+    if (!appDoc) return res.status(404).json({ error: 'Application not found.' });
+
+    const statusTransitionedToRejected = 
+      update.status === 'rejected' && appDoc.status !== 'rejected';
+
+    // Apply updates and save
+    Object.assign(appDoc, update);
+    const savedApp = await appDoc.save();
+
+    // Trigger rejection email asynchronously if transitioned
+    if (statusTransitionedToRejected && savedApp.email) {
+      const candidateName = savedApp.first_name || 'Candidate';
+      const jobTitle = savedApp.job_title || 'the applied role';
+      const rejectSubject = `Application Status Update: ${savedApp.job_title || 'Your Application'} — Covenant Crest Group`;
+      const rejectHtml = `
+        <div style="font-family:Arial,sans-serif;padding:32px;background:#FAF9F6;color:#0D1B2A;border-radius:12px;border:1px solid #E8E4DC;max-width:600px;margin:0 auto;">
+          <div style="text-align:center;border-bottom:2px solid #C9A84C;padding-bottom:20px;margin-bottom:24px;">
+            <h2 style="color:#0D1B2A;margin:0;font-size:26px;">Covenant Crest Group</h2>
+            <p style="color:#7A8694;margin:4px 0 0;font-size:12px;letter-spacing:0.15em;text-transform:uppercase;">Application Update</p>
+          </div>
+          <h3 style="color:#0D1B2A;font-size:18px;">Dear ${candidateName},</h3>
+          <p style="font-size:14px;line-height:1.75;color:#4A5568;">Thank you for your interest in the <strong>${jobTitle}</strong> position with Covenant Crest Group and for taking the time to apply.</p>
+          <p style="font-size:14px;line-height:1.75;color:#4A5568;">We received a large number of applications from highly qualified candidates. After careful review of your CV and background details, we regret to inform you that we will not be moving forward with your application for this position.</p>
+          <p style="font-size:14px;line-height:1.75;color:#4A5568;">We appreciate the time you invested in applying to Covenant Crest. We will retain your registration details in our talent pool database and will reach out to you if another opportunity arises that aligns with your skills and experience.</p>
+          <p style="font-size:14px;line-height:1.75;color:#4A5568;">We wish you the very best in your job search and future career endeavors.</p>
+          <br>
+          <p style="font-size:14px;font-weight:600;color:#0D1B2A;margin:0;">Kind regards,</p>
+          <p style="font-size:13px;color:#7A8694;margin:4px 0 0;">The Recruitment Team</p>
+          <p style="font-size:13px;color:#C9A84C;font-weight:600;margin:2px 0 0;">Covenant Crest Group</p>
+          
+          <div style="border-top:1px solid #E8E4DC;margin-top:28px;padding-top:16px;text-align:center;font-size:11px;color:#9AA5B4;">
+            Covenant Crest Group Ltd &bull; Registered in England & Wales Co. No. 16528951 &bull; Built on Promise.
+          </div>
+        </div>
+      `;
+
+      sendEmail({
+        to: savedApp.email,
+        subject: rejectSubject,
+        html: rejectHtml,
+        from: 'recruitment@covenantcrest.co.uk'
+      }).catch(err => console.error('[reject-email] Failed to send rejection mail to:', savedApp.email, err.message));
+    }
+
+    res.json(savedApp);
+  } catch(e) { 
+    console.error('Update application error:', e.message);
+    res.status(500).json({ error: 'Failed to update application' }); 
+  }
 });
 
 /** DELETE /api/applications/:id */
@@ -1637,6 +1762,16 @@ app.post('/api/netlify-webhook', async (req, res) => {
       cvUrl       : null,
       status      : 'new',
       source      : 'netlify-form',
+      // Map other whitelisted properties if available
+      postcode    : sanitise(data.postcode || '', 20),
+      rtw_status  : sanitise(data.rtw_status || '', 40),
+      visa_details: sanitise(data.visa_details || '', 200),
+      is_veteran  : sanitise(data.is_veteran || '', 10),
+      assistance  : sanitise(data.assistance || '', 300),
+      nmc_pin     : sanitise(data.nmc_pin || '', 50),
+      cscs_number : sanitise(data.cscs_number || '', 50),
+      food_hygiene_level: sanitise(data.food_hygiene_level || data.hygiene_cert || '', 100),
+      hgv_license : sanitise(data.hgv_license || data.hgv_number || '', 100),
     });
     await entry.save();
 
@@ -1651,14 +1786,50 @@ app.post('/api/netlify-webhook', async (req, res) => {
   }
 
   // ── All other forms → Contact Enquiries ──────────────────────
+  let computedMessage = data.message || data.notes || data.details || '';
+  
+  // Structured mapping to prevent B2B / quote / enquiry data loss
+  if (formName === 'recruitment-request-staff') {
+    const parts = [];
+    if (data.service_model) parts.push(`Service Model: ${data.service_model}`);
+    if (data.sector) parts.push(`Sector: ${data.sector}`);
+    if (data.shift_patterns) parts.push(`Shift Patterns: ${data.shift_patterns}`);
+    if (data.job_title) parts.push(`Job Title: ${data.job_title}`);
+    if (data.workers_needed) parts.push(`Workers Needed: ${data.workers_needed}`);
+    if (data.start_date) parts.push(`Start Date: ${data.start_date}`);
+    if (data.postcode) parts.push(`Site Postcode: ${data.postcode}`);
+    if (computedMessage) parts.push(`Additional Notes: ${computedMessage}`);
+    computedMessage = parts.join('\n');
+  } else if (formName === 'haulage-quote') {
+    const parts = [];
+    if (data.collection) parts.push(`Collection: ${data.collection}`);
+    if (data.delivery) parts.push(`Delivery: ${data.delivery}`);
+    if (data.load_type) parts.push(`Load Type: ${data.load_type}`);
+    if (data.weight) parts.push(`Weight: ${data.weight}`);
+    if (computedMessage) parts.push(`Details: ${computedMessage}`);
+    computedMessage = parts.join('\n');
+  } else if (formName === 'trade-enquiry') {
+    const parts = [];
+    if (data.product) parts.push(`Product: ${data.product}`);
+    if (data.quantity) parts.push(`Quantity: ${data.quantity}`);
+    if (data.frequency) parts.push(`Frequency: ${data.frequency}`);
+    if (data.incoterm) parts.push(`Incoterm: ${data.incoterm}`);
+    if (computedMessage) parts.push(`Details: ${computedMessage}`);
+    computedMessage = parts.join('\n');
+  } else if (formName === 'compliance-pack-request') {
+    const parts = [];
+    if (data.role) parts.push(`Requestor Role: ${data.role}`);
+    computedMessage = parts.join('\n');
+  }
+
   const contact = new Contact({
     id     : uid(),
-    name   : sanitise(data.full_name || data.name || data.first_name || '', 120), // Bug 6: Support full_name from webhook
-    email  : sanitise(data.email || '', 200),
-    phone  : sanitise(data.phone || '', 30),
-    company: sanitise(data.company || '', 200), // Bug 7: Support B2B company in webhook
+    name   : sanitise(data.full_name || data.name || data.first_name || data.contact_name || '', 120),
+    email  : sanitise(data.email || (data.contact && data.contact.includes('@') ? data.contact : '') || '', 200),
+    phone  : sanitise(data.phone || (data.contact && !data.contact.includes('@') ? data.contact : '') || '', 30),
+    company: sanitise(data.company || data.company_name || '', 200),
     type   : sanitise(data.enquiry_type || data.type || formName || 'general', 40),
-    message: sanitise(data.message || data.notes || '', 3000),
+    message: sanitise(computedMessage, 3000),
     source : sanitise(formName || 'netlify-webhook', 50),
     status : 'new',
   });
@@ -1852,6 +2023,28 @@ app.post('/api/diagnostics/test-hubspot', requireSuperAdmin, async (req, res) =>
   }
 });
 
+/**
+ * GET /api/auth/2fa-setup — Admin only
+ * Returns the 2FA setup status and raw secret key for manual entry, or QR code URL
+ */
+app.get('/api/auth/2fa-setup', requireSuperAdmin, (req, res) => {
+  const secret = CFG.SUPER_ADMIN_2FA_SECRET;
+  if (!secret) {
+    return res.json({ 
+      enabled: false, 
+      message: '2FA is not enabled. Add SUPER_ADMIN_2FA_SECRET to your Render environment variables to enable it.' 
+    });
+  }
+  const email = CFG.SUPER_ADMIN_EMAIL;
+  const issuer = 'Covenant Crest';
+  const otpauthUrl = `otpauth://totp/${encodeURIComponent(issuer)}:${encodeURIComponent(email)}?secret=${secret}&issuer=${encodeURIComponent(issuer)}`;
+  res.json({
+    enabled: true,
+    secret: secret,
+    qrCodeUrl: `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(otpauthUrl)}`
+  });
+});
+
 // ─────────────────────────────────────────────
 // MICROSOFT 365 GRAPH API INTEGRATION (Teams & Calendar)
 // ─────────────────────────────────────────────
@@ -1926,7 +2119,7 @@ app.post('/api/interviews/schedule-teams', requireAuth, async (req, res) => {
       const emailHtml = `
         <div style="font-family:Arial,sans-serif;padding:32px;background:#FAF9F6;color:#0D1B2A;border-radius:12px;border:1px solid #E8E4DC;max-width:600px;margin:0 auto;">
           <div style="text-align:center;border-bottom:2px solid #C9A84C;padding-bottom:20px;margin-bottom:24px;">
-            <h2 style="color:#0D1B2A;margin:0;font-size:26px;">Covenant Crest Group Ltd</h2>
+            <h2 style="color:#0D1B2A;margin:0;font-size:26px;">Covenant Crest Group</h2>
             <p style="color:#7A8694;margin:4px 0 0;font-size:12px;letter-spacing:0.15em;text-transform:uppercase;">Interview Invitation</p>
           </div>
           <h3 style="color:#0D1B2A;font-size:18px;">Dear ${candidateName},</h3>
@@ -2048,7 +2241,7 @@ app.post('/api/interviews/schedule-teams', requireAuth, async (req, res) => {
           content: `
             <div style="font-family:Arial,sans-serif;padding:32px;background:#FAF9F6;color:#0D1B2A;border-radius:12px;border:1px solid #E8E4DC;max-width:600px;margin:0 auto;">
               <div style="text-align:center;border-bottom:2px solid #C9A84C;padding-bottom:20px;margin-bottom:24px;">
-                <h2 style="color:#0D1B2A;margin:0;font-size:26px;">Covenant Crest Group Ltd</h2>
+                <h2 style="color:#0D1B2A;margin:0;font-size:26px;">Covenant Crest Group</h2>
                 <p style="color:#7A8694;margin:4px 0 0;font-size:12px;letter-spacing:0.15em;text-transform:uppercase;">Interview Invitation</p>
               </div>
               <h3 style="color:#0D1B2A;font-size:18px;">Dear ${candidateName},</h3>
@@ -2147,13 +2340,23 @@ app.listen(PORT, () => {
   console.log(`   Allowed Origin: ${CFG.ALLOWED_ORIGIN}`);
   console.log(`   CRM Engine    : ${CFG.HUBSPOT_ACCESS_TOKEN ? '✅ HubSpot API v3 CRM Active' : '⚠️  HUBSPOT_ACCESS_TOKEN not set'}`);
   console.log(`   Mail Engine   : ${CFG.RESEND_API_KEY ? '✅ Resend Outbound Service Active' : '⚠️  RESEND_API_KEY not set'}`);
-  console.log(`   Microsoft SSO : ${CFG.MICROSOFT_CLIENT_ID ? '✅ Azure AD SSO Configured' : '⚠️  MICROSOFT_CLIENT_ID not set'}`);
-console.log(`   Cloudinary    : ${CFG.CLOUDINARY_KEY  ? '✅ Assets CDN Configured' : '⚠️  credentials not set'}`);
+  
+  if (CFG.MICROSOFT_CLIENT_ID && CFG.MICROSOFT_TENANT_ID === 'common') {
+    console.log('   Microsoft SSO : ⚠️  MICROSOFT_TENANT_ID is set to "common". Microsoft Graph calendar/Teams scheduling will not function. Please configure your specific Azure Directory (Tenant) ID.');
+  } else if (CFG.MICROSOFT_CLIENT_ID) {
+    console.log('   Microsoft SSO : ✅ Azure AD SSO Configured');
+  } else {
+    console.log('   Microsoft SSO : ⚠️  MICROSOFT_CLIENT_ID not set');
+  }
+
+  console.log(`   Cloudinary    : ${CFG.CLOUDINARY_KEY  ? '✅ Assets CDN Configured' : '⚠️  credentials not set'}`);
+  console.log(`   Authenticator : ${CFG.SUPER_ADMIN_2FA_SECRET ? '✅ 2FA Authentication Enforced' : '⚠️  SUPER_ADMIN_2FA_SECRET not set (2FA inactive)'}`);
   console.log('\n📋 Active Premium Endpoints:');
   [
     'GET    /api/jobs                — public job listings',
     'POST   /api/auth/login          — traditional user login',
     'GET    /api/auth/me             — retrieve active session',
+    'GET    /api/auth/2fa-setup      — retrieve admin 2FA QR code (auth)',
     'GET    /api/auth/microsoft-login — start secure Microsoft Admin SSO',
     'GET    /api/auth/microsoft-callback — secure Microsoft auth callback',
     'GET    /api/contacts            — view client inquiries (auth)',
