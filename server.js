@@ -97,7 +97,7 @@ const CFG = {
   // Email (Resend)
   RESEND_API_KEY    : process.env.RESEND_API_KEY    || '',
   EMAIL_FROM        : process.env.EMAIL_FROM        || 'noreply@covenantcrest.co.uk',
-  EMAIL_NOTIFY      : process.env.EMAIL_NOTIFY      || 'jaby.k@covenantcrest.co.uk',
+  EMAIL_NOTIFY      : process.env.EMAIL_NOTIFY      || 'recruitment@covenantcrest.co.uk',
 
   // Cloudinary (will also check CLOUDINARY_URL below)
   CLOUDINARY_CLOUD  : (process.env.CLOUDINARY_CLOUD_NAME || '').trim(),
@@ -205,6 +205,8 @@ const AppSchema = new mongoose.Schema({
   cvBase64: String, // though we prefer Cloudinary
   status: { type: String, default: 'new' },
   matchScore: Number,
+  rejectionReason: String,
+  requestedDocs: String,
   // Compliance fields
   dbs_level: String,
   dbs_issue_date: String,
@@ -562,8 +564,8 @@ const emailTpl = {
   },
 
   /* Admin alert when a candidate applies */
-  newApplicationAlert({ first_name, last_name, email, phone, sector, job_title }) {
-    return {
+  newApplicationAlert({ first_name, last_name, email, phone, sector, job_title, cvUrl }, cvBase64, cvFileName) {
+    const emailData = {
       to     : CFG.EMAIL_NOTIFY,
       subject: `[Covenant Crest] New application — ${first_name} ${last_name} (${sector || 'general'})`,
       html   : `
@@ -578,12 +580,20 @@ const emailTpl = {
               <tr><td style="padding:8px 0;color:#666;font-size:13px;">Phone</td><td style="padding:8px 0;font-size:13px;">${htmlEsc(phone) || 'Not provided'}</td></tr>
               <tr><td style="padding:8px 0;color:#666;font-size:13px;">Sector</td><td style="padding:8px 0;font-size:13px;">${htmlEsc(sector) || '—'}</td></tr>
               <tr><td style="padding:8px 0;color:#666;font-size:13px;">Job</td><td style="padding:8px 0;font-size:13px;">${htmlEsc(job_title) || '—'}</td></tr>
+              ${cvUrl ? `<tr><td style="padding:8px 0;color:#666;font-size:13px;">Cloud Link</td><td style="padding:8px 0;font-size:13px;"><a href="${cvUrl}" target="_blank" style="color:#C9A84C;">View Online CV</a></td></tr>` : ''}
             </table>
             <hr style="margin:16px 0;border:none;border-top:1px solid #eee;">
             <p style="font-size:11px;color:#999;margin:0;">Received: ${new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' })}</p>
           </div>
         </div>`,
     };
+    if (cvBase64 && cvFileName) {
+      emailData.attachments = [{
+        content: cvBase64,
+        filename: cvFileName
+      }];
+    }
+    return emailData;
   },
 
   /* Job alert email — sent to subscriber when a matching new job is posted */
@@ -609,6 +619,13 @@ const emailTpl = {
           </div>
         </div>`,
     };
+    if (cvBase64 && cvFileName) {
+      emailData.attachments = [{
+        content: cvBase64,
+        filename: cvFileName
+      }];
+    }
+    return emailData;
   },
 };
 
@@ -1527,7 +1544,7 @@ app.post('/api/applications', rateLimit(15 * 60 * 1000, 5), async (req, res) => 
     
     // Non-blocking emails + CRM Sync
     Promise.allSettled([
-      sendEmail(emailTpl.newApplicationAlert(entry)),
+      sendEmail(emailTpl.newApplicationAlert(entry, cvBase64, cvFileName)),
       entry.email ? sendEmail({ ...emailTpl.applicationAutoReply(entry), to: entry.email, from: 'recruitment@covenantcrest.co.uk' }) : Promise.resolve(),
       syncToHubSpot(entry, 'candidate').catch(e => console.error('[HubSpot] Candidate CRM Sync failed:', e.message))
     ]);
@@ -1546,7 +1563,8 @@ app.put('/api/applications/:id', requireAuth, async (req, res) => {
       'rtw_doc_type', 'rtw_expiry_date', 'rtw_verified',
       'manual_handling_cert', 'compliance_notes', 'compliance_status',
       'postcode', 'rtw_status', 'visa_details', 'is_veteran', 'assistance',
-      'nmc_pin', 'cscs_number', 'food_hygiene_level', 'hgv_license'
+      'nmc_pin', 'cscs_number', 'food_hygiene_level', 'hgv_license',
+      'rejectionReason', 'requestedDocs'
     ];
     const update = {};
     for (const key of allowed) {
@@ -1581,7 +1599,7 @@ app.put('/api/applications/:id', requireAuth, async (req, res) => {
           </div>
           <h3 style="color:#0D1B2A;font-size:18px;">Dear ${candidateName},</h3>
           <p style="font-size:14px;line-height:1.75;color:#4A5568;">Thank you for your interest in the <strong>${jobTitle}</strong> position with Covenant Crest Group and for taking the time to apply.</p>
-          <p style="font-size:14px;line-height:1.75;color:#4A5568;">We received a large number of applications from highly qualified candidates. After careful review of your CV and background details, we regret to inform you that we will not be moving forward with your application for this position.</p>
+          <p style="font-size:14px;line-height:1.75;color:#4A5568;">${savedApp.rejectionReason || 'We received a large number of applications from highly qualified candidates. After careful review of your CV and background details, we regret to inform you that we will not be moving forward with your application for this position.'}</p>
           <p style="font-size:14px;line-height:1.75;color:#4A5568;">We appreciate the time you invested in applying to Covenant Crest. We will retain your registration details in our talent pool database and will reach out to you if another opportunity arises that aligns with your skills and experience.</p>
           <p style="font-size:14px;line-height:1.75;color:#4A5568;">We wish you the very best in your job search and future career endeavors.</p>
           <br>
@@ -1601,6 +1619,47 @@ app.put('/api/applications/:id', requireAuth, async (req, res) => {
         html: rejectHtml,
         from: 'recruitment@covenantcrest.co.uk'
       }).catch(err => console.error('[reject-email] Failed to send rejection mail to:', savedApp.email, err.message));
+    }
+
+    // Trigger document request email asynchronously if transitioned to docs_requested
+    const statusTransitionedToDocsRequested = 
+      update.status === 'docs_requested' && appDoc.status !== 'docs_requested';
+      
+    if (statusTransitionedToDocsRequested && savedApp.email) {
+      const candidateName = savedApp.first_name || 'Candidate';
+      const docsRequestedText = savedApp.requestedDocs || 'Missing CV or compliance certifications.';
+      const docsSubject = `Action Required: Missing Information for your Covenant Crest Application - ${savedApp.job_title || 'Role'}`;
+      const docsHtml = `
+        <div style="font-family:Arial,sans-serif;padding:32px;background:#FAF9F6;color:#0D1B2A;border-radius:12px;border:1px solid #E8E4DC;max-width:600px;margin:0 auto;">
+          <div style="text-align:center;border-bottom:2px solid #C9A84C;padding-bottom:20px;margin-bottom:24px;">
+            <h2 style="color:#0D1B2A;margin:0;font-size:26px;">Covenant Crest Group</h2>
+            <p style="color:#7A8694;margin:4px 0 0;font-size:12px;letter-spacing:0.15em;text-transform:uppercase;">Information Request</p>
+          </div>
+          <h3 style="color:#0D1B2A;font-size:18px;">Dear ${candidateName},</h3>
+          <p style="font-size:14px;line-height:1.75;color:#4A5568;">Thank you for your interest in the <strong>${savedApp.job_title || 'applied role'}</strong> position with Covenant Crest Group.</p>
+          <p style="font-size:14px;line-height:1.75;color:#4A5568;">While reviewing your application, we noted that we require some additional documentation or details to proceed with your vetting process:</p>
+          <div style="background:#FFFDF0;padding:16px;border-left:4px solid #C9A84C;border-radius:4px;margin:18px 0;font-size:14px;line-height:1.75;color:#0D1B2A;font-family:monospace;">
+            <strong>Requested items:</strong><br>
+            ${docsRequestedText.split('\n').join('<br>')}
+          </div>
+          <p style="font-size:14px;line-height:1.75;color:#4A5568;">Please reply directly to this email and attach the requested files or provide the information as soon as possible so we can move your application forward.</p>
+          <br>
+          <p style="font-size:14px;font-weight:600;color:#0D1B2A;margin:0;">Kind regards,</p>
+          <p style="font-size:13px;color:#7A8694;margin:4px 0 0;">The Recruitment Team</p>
+          <p style="font-size:13px;color:#C9A84C;font-weight:600;margin:2px 0 0;">Covenant Crest Group</p>
+          
+          <div style="border-top:1px solid #E8E4DC;margin-top:28px;padding-top:16px;text-align:center;font-size:11px;color:#9AA5B4;">
+            Covenant Crest Group Ltd &bull; Registered in England & Wales Co. No. 16528951 &bull; Built on Promise.
+          </div>
+        </div>
+      `;
+
+      sendEmail({
+        to: savedApp.email,
+        subject: docsSubject,
+        html: docsHtml,
+        from: 'recruitment@covenantcrest.co.uk'
+      }).catch(err => console.error('[docs-request-email] Failed to send email to:', savedApp.email, err.message));
     }
 
     res.json(savedApp);
@@ -1932,7 +1991,7 @@ async function syncToHubSpot(data, type) {
  * Direct email dispatcher utilizing the Resend API to deliver alerts
  * straight to your corporate Outlook inbox.
  */
-async function sendEmail({ to, subject, html, from }) {
+async function sendEmail({ to, subject, html, from, attachments }) {
   if (!CFG.RESEND_API_KEY) {
     console.warn('[email] Resend API Key is not set. Outbound mail was bypassed:', subject);
     return Promise.resolve({ bypassed: true });
@@ -1940,12 +1999,16 @@ async function sendEmail({ to, subject, html, from }) {
 
   const fromAddress = from || CFG.EMAIL_FROM;
   const recipients = Array.isArray(to) ? to : [to];
-  const body = JSON.stringify({
+  const payload = {
     from   : `Covenant Crest <${fromAddress}>`,
     to     : recipients,
     subject,
     html,
-  });
+  };
+  if (attachments && attachments.length > 0) {
+    payload.attachments = attachments;
+  }
+  const body = JSON.stringify(payload);
 
   return new Promise((resolve, reject) => {
     const req = https.request({
