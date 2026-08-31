@@ -1208,7 +1208,7 @@ app.get('/api/jobs/:id', async (req, res) => {
 
 /** POST /api/jobs — create job (auth required) */
 app.post('/api/jobs', requireAuth, async (req, res) => {
-  const { title, pay, sector, type, location, desc, req: requirements, status, imageBase64, closingDate, seoKeywords, seoDesc } = req.body;
+  const { title, pay, sector, type, location, desc, req: requirements, status, imageBase64, closingDate, seoKeywords, seoDesc, isCorporate, workplace } = req.body;
   if (!title || !pay) return res.status(400).json({ error: 'Title and pay are required.' });
 
   let imageUrl = null;
@@ -1234,6 +1234,8 @@ app.post('/api/jobs', requireAuth, async (req, res) => {
       closingDate,
       seoKeywords,
       seoDesc,
+      isCorporate : isCorporate === true || isCorporate === 'true',
+      workplace   : sanitise(workplace || '', 20),
     });
     await job.save();
 
