@@ -232,6 +232,22 @@ const AppSchema = new mongoose.Schema({
   cscs_number: String,
   food_hygiene_level: String,
   hgv_license: String,
+  // Interview Scheduling
+  interviewDate: String,
+  interviewTime: String,
+  interviewType: String,
+  interviewLocation: String,
+  interviewNotes: String,
+  interviewStatus: String,
+  // Document Portal Token & Uploaded Files
+  docToken: String,
+  requestedDocsList: [String],
+  uploadedDocs: [{
+    docType: String,
+    fileName: String,
+    fileUrl: String,
+    uploadedAt: { type: Date, default: Date.now }
+  }],
   date: { type: Date, default: Date.now }
 }, { timestamps: true });
 
@@ -1678,6 +1694,235 @@ app.delete('/api/applications/:id', requireAuth, async (req, res) => {
     if (result.deletedCount === 0) return res.status(404).json({ error: 'Application not found.' });
     res.json({ success: true });
   } catch(e) { res.status(500).json({ error: 'Failed to delete application' }); }
+});
+
+/** POST /api/applications/import-indeed — bulk import candidate array */
+app.post('/api/applications/import-indeed', requireAuth, async (req, res) => {
+  try {
+    const candidates = Array.isArray(req.body.candidates) ? req.body.candidates : [];
+    if (!candidates.length) {
+      return res.status(400).json({ error: 'No candidate records provided.' });
+    }
+    const imported = [];
+    for (const c of candidates) {
+      const email = sanitise(c.email || '', 200).toLowerCase();
+      if (!email) continue;
+      let appDoc = await Application.findOne({ email });
+      if (!appDoc) {
+        appDoc = new Application({
+          id: uid(),
+          first_name: sanitise(c.first_name || '', 80),
+          last_name: sanitise(c.last_name || '', 80),
+          email: email,
+          phone: sanitise(c.phone || '', 30),
+          job_title: sanitise(c.job_title || 'General Applicant', 120),
+          sector: sanitise(c.sector || 'care', 40),
+          notes: sanitise(c.notes || '', 1000),
+          source: 'indeed',
+          status: 'new'
+        });
+      } else {
+        if (c.job_title) appDoc.job_title = sanitise(c.job_title, 120);
+        if (c.notes) appDoc.notes = (appDoc.notes ? appDoc.notes + '\n' : '') + sanitise(c.notes, 500);
+        appDoc.source = appDoc.source || 'indeed';
+      }
+      if (c.cvBase64) {
+        try {
+          const up = await cloudinaryUpload(c.cvBase64, 'covenantcrest/cvs', `cv-indeed-${appDoc.id}`, 'raw');
+          appDoc.cvUrl = up.url;
+        } catch (e) { console.error('Cloudinary upload error:', e.message); }
+      }
+      await appDoc.save();
+      imported.push(appDoc);
+    }
+    res.json({ success: true, count: imported.length, candidates: imported });
+  } catch (e) {
+    console.error('Import Indeed error:', e.message);
+    res.status(500).json({ error: 'Failed to import candidates.' });
+  }
+});
+
+/** POST /api/applications/:id/schedule-interview */
+app.post('/api/applications/:id/schedule-interview', requireAuth, async (req, res) => {
+  try {
+    const { date, time, type = 'teams', location = '', notes = '' } = req.body;
+    const appDoc = await Application.findOne({ id: req.params.id });
+    if (!appDoc) return res.status(404).json({ error: 'Application not found.' });
+
+    appDoc.interviewDate = sanitise(String(date), 30);
+    appDoc.interviewTime = sanitise(String(time), 30);
+    appDoc.interviewType = sanitise(String(type), 30);
+    appDoc.interviewLocation = sanitise(String(location), 300);
+    appDoc.interviewNotes = sanitise(String(notes), 1000);
+    appDoc.interviewStatus = 'scheduled';
+    appDoc.status = 'shortlisted';
+
+    if (!appDoc.docToken) {
+      appDoc.docToken = crypto.randomBytes(16).toString('hex');
+    }
+
+    await appDoc.save();
+
+    if (appDoc.email) {
+      const typeLabel = type === 'in_person' ? 'On-site Office Interview' : type === 'phone' ? 'Phone Interview' : 'Microsoft Teams Video Interview';
+      const portalLink = `https://www.covenantcrest.co.uk/portal.html?token=${appDoc.docToken}`;
+      const emailHtml = `
+        <div style="font-family:Arial,sans-serif;padding:32px;background:#FAF9F6;color:#0D1B2A;border-radius:12px;border:1px solid #E8E4DC;max-width:600px;margin:0 auto;">
+          <div style="text-align:center;border-bottom:2px solid #C9A84C;padding-bottom:20px;margin-bottom:24px;">
+            <h2 style="color:#0D1B2A;margin:0;font-size:26px;">Covenant Crest Group</h2>
+            <p style="color:#7A8694;margin:4px 0 0;font-size:12px;letter-spacing:0.15em;text-transform:uppercase;">Interview Invitation</p>
+          </div>
+          <h3 style="color:#0D1B2A;font-size:18px;">Dear ${appDoc.first_name || 'Candidate'},</h3>
+          <p style="font-size:14px;line-height:1.75;color:#4A5568;">We are pleased to invite you to an interview for the <strong>${appDoc.job_title || 'applied role'}</strong> position with Covenant Crest Group.</p>
+          <div style="background:#FFFDF0;padding:20px;border-left:4px solid #C9A84C;border-radius:6px;margin:20px 0;font-size:14px;line-height:1.8;color:#0D1B2A;">
+            <strong>📅 Date:</strong> ${appDoc.interviewDate}<br>
+            <strong>⏰ Time:</strong> ${appDoc.interviewTime}<br>
+            <strong>📌 Format:</strong> ${typeLabel}<br>
+            ${appDoc.interviewLocation ? `<strong>📍 Location / Link:</strong> ${appDoc.interviewLocation}<br>` : ''}
+            ${appDoc.interviewNotes ? `<strong>📝 Notes:</strong> ${appDoc.interviewNotes}` : ''}
+          </div>
+          <p style="font-size:14px;line-height:1.75;color:#4A5568;">You can manage your interview details or upload compliance documents anytime on your private candidate portal below:</p>
+          <div style="text-align:center;margin:28px 0;">
+            <a href="${portalLink}" style="background:#0D1B2A;color:#C9A84C;padding:12px 28px;text-decoration:none;border-radius:6px;font-weight:700;font-size:13px;display:inline-block;">Access Candidate Portal &rarr;</a>
+          </div>
+          <p style="font-size:14px;line-height:1.75;color:#4A5568;">If you need to reschedule, please notify us as soon as possible.</p>
+          <br>
+          <p style="font-size:14px;font-weight:600;color:#0D1B2A;margin:0;">Kind regards,</p>
+          <p style="font-size:13px;color:#7A8694;margin:4px 0 0;">The Recruitment Team</p>
+          <p style="font-size:13px;color:#C9A84C;font-weight:600;margin:2px 0 0;">Covenant Crest Group</p>
+        </div>
+      `;
+      sendEmail({
+        to: appDoc.email,
+        subject: `Interview Scheduled: ${appDoc.job_title || 'Role'} — Covenant Crest Group`,
+        html: emailHtml,
+        from: 'recruitment@covenantcrest.co.uk'
+      }).catch(e => console.error('[interview-email] Failed:', e.message));
+    }
+
+    res.json({ success: true, application: appDoc, portalUrl: `https://www.covenantcrest.co.uk/portal.html?token=${appDoc.docToken}` });
+  } catch (e) {
+    console.error('Schedule interview error:', e.message);
+    res.status(500).json({ error: 'Failed to schedule interview.' });
+  }
+});
+
+/** POST /api/applications/:id/request-docs */
+app.post('/api/applications/:id/request-docs', requireAuth, async (req, res) => {
+  try {
+    const { requestedDocsList = [], customNote = '' } = req.body;
+    const appDoc = await Application.findOne({ id: req.params.id });
+    if (!appDoc) return res.status(404).json({ error: 'Application not found.' });
+
+    if (!appDoc.docToken) {
+      appDoc.docToken = crypto.randomBytes(16).toString('hex');
+    }
+    appDoc.requestedDocsList = requestedDocsList.map(d => sanitise(String(d), 50));
+    appDoc.status = 'docs_requested';
+    if (customNote) appDoc.requestedDocs = sanitise(String(customNote), 500);
+
+    await appDoc.save();
+
+    const portalUrl = `https://www.covenantcrest.co.uk/portal.html?token=${appDoc.docToken}`;
+
+    if (appDoc.email) {
+      const emailHtml = `
+        <div style="font-family:Arial,sans-serif;padding:32px;background:#FAF9F6;color:#0D1B2A;border-radius:12px;border:1px solid #E8E4DC;max-width:600px;margin:0 auto;">
+          <div style="text-align:center;border-bottom:2px solid #C9A84C;padding-bottom:20px;margin-bottom:24px;">
+            <h2 style="color:#0D1B2A;margin:0;font-size:26px;">Covenant Crest Group</h2>
+            <p style="color:#7A8694;margin:4px 0 0;font-size:12px;letter-spacing:0.15em;text-transform:uppercase;">Document Verification</p>
+          </div>
+          <h3 style="color:#0D1B2A;font-size:18px;">Dear ${appDoc.first_name || 'Candidate'},</h3>
+          <p style="font-size:14px;line-height:1.75;color:#4A5568;">To complete your onboarding for the <strong>${appDoc.job_title || 'applied role'}</strong>, please upload your requested verification documents via our candidate portal.</p>
+          <div style="background:#FFFDF0;padding:16px;border-left:4px solid #C9A84C;border-radius:4px;margin:18px 0;font-size:14px;color:#0D1B2A;">
+            <strong>Requested Documents:</strong><br>
+            ${requestedDocsList.map(d => '• ' + d.toUpperCase()).join('<br>')}
+            ${customNote ? `<br><br><em>${customNote}</em>` : ''}
+          </div>
+          <div style="text-align:center;margin:28px 0;">
+            <a href="${portalUrl}" style="background:#0D1B2A;color:#C9A84C;padding:12px 28px;text-decoration:none;border-radius:6px;font-weight:700;font-size:13px;display:inline-block;">Upload Documents Securely &rarr;</a>
+          </div>
+          <p style="font-size:13px;color:#7A8694;">You can upload files (PDF or Images) directly from your smartphone or computer.</p>
+          <br>
+          <p style="font-size:14px;font-weight:600;color:#0D1B2A;margin:0;">Kind regards,</p>
+          <p style="font-size:13px;color:#7A8694;margin:4px 0 0;">Compliance Team</p>
+          <p style="font-size:13px;color:#C9A84C;font-weight:600;margin:2px 0 0;">Covenant Crest Group</p>
+        </div>
+      `;
+      sendEmail({
+        to: appDoc.email,
+        subject: `Document Request: ${appDoc.job_title || 'Application Verification'} — Covenant Crest`,
+        html: emailHtml,
+        from: 'recruitment@covenantcrest.co.uk'
+      }).catch(e => console.error('[doc-request-email] Failed:', e.message));
+    }
+
+    res.json({ success: true, token: appDoc.docToken, portalUrl });
+  } catch (e) {
+    console.error('Request docs error:', e.message);
+    res.status(500).json({ error: 'Failed to request documents.' });
+  }
+});
+
+/** GET /api/portal/candidate/:token — Public portal load */
+app.get('/api/portal/candidate/:token', async (req, res) => {
+  try {
+    const appDoc = await Application.findOne({ docToken: req.params.token });
+    if (!appDoc) return res.status(404).json({ error: 'Invalid or expired candidate portal link.' });
+
+    res.json({
+      id: appDoc.id,
+      first_name: appDoc.first_name,
+      last_name: appDoc.last_name,
+      job_title: appDoc.job_title,
+      sector: appDoc.sector,
+      status: appDoc.status,
+      requestedDocsList: appDoc.requestedDocsList || [],
+      requestedDocs: appDoc.requestedDocs || '',
+      uploadedDocs: appDoc.uploadedDocs || [],
+      interviewDate: appDoc.interviewDate,
+      interviewTime: appDoc.interviewTime,
+      interviewType: appDoc.interviewType,
+      interviewLocation: appDoc.interviewLocation,
+      interviewStatus: appDoc.interviewStatus,
+      cvUrl: appDoc.cvUrl
+    });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to load candidate portal.' });
+  }
+});
+
+/** POST /api/portal/candidate/:token/upload — Public candidate document upload */
+app.post('/api/portal/candidate/:token/upload', rateLimit(15 * 60 * 1000, 10), async (req, res) => {
+  try {
+    const { docType = 'document', fileName = 'upload.pdf', fileBase64 } = req.body;
+    if (!fileBase64) return res.status(400).json({ error: 'No file content provided.' });
+
+    const appDoc = await Application.findOne({ docToken: req.params.token });
+    if (!appDoc) return res.status(404).json({ error: 'Invalid or expired candidate portal link.' });
+
+    let publicId = `doc-${docType}-${appDoc.id}-${Date.now()}`;
+    const up = await cloudinaryUpload(fileBase64, 'covenantcrest/candidate_docs', publicId, 'raw');
+
+    const newDoc = {
+      docType: sanitise(String(docType), 50),
+      fileName: sanitise(String(fileName), 100),
+      fileUrl: up.url,
+      uploadedAt: new Date()
+    };
+
+    appDoc.uploadedDocs = appDoc.uploadedDocs || [];
+    appDoc.uploadedDocs.push(newDoc);
+    appDoc.status = 'docs_received';
+    appDoc.compliance_status = 'review_pending';
+
+    await appDoc.save();
+
+    res.json({ success: true, uploadedDoc: newDoc, allDocs: appDoc.uploadedDocs });
+  } catch (e) {
+    console.error('Candidate portal upload error:', e.message);
+    res.status(500).json({ error: 'Failed to upload document.' });
+  }
 });
 
 /** GET /api/compliance/expiring — hired workers with docs expiring within 90 days (auth) */
