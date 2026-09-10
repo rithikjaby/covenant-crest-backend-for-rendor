@@ -870,10 +870,16 @@ function cloudinaryDelete(imageUrl) {
 function cloudinarySignedDownloadUrl(publicId, resourceType = 'raw') {
   if (!publicId || !CFG.CLOUDINARY_CLOUD || !CFG.CLOUDINARY_KEY || !CFG.CLOUDINARY_SECRET) return null;
   const timestamp = Math.floor(Date.now() / 1000);
-  const sigStr    = `public_id=${publicId}&timestamp=${timestamp}` + CFG.CLOUDINARY_SECRET;
+  // 'type' (delivery type) MUST be included and signed — without it Cloudinary's
+  // /download endpoint looks in the default 'upload' bucket instead of
+  // 'authenticated', where these private documents actually live, and the
+  // request fails. Matches Cloudinary's own SDKs' private_download_url signing.
+  const params = { public_id: publicId, timestamp, type: 'authenticated' };
+  const sigStr = Object.keys(params).sort()
+    .map(k => `${k}=${params[k]}`).join('&') + CFG.CLOUDINARY_SECRET;
   const signature = crypto.createHash('sha1').update(sigStr).digest('hex');
   return `https://api.cloudinary.com/v1_1/${CFG.CLOUDINARY_CLOUD}/${resourceType}/download?` +
-    new URLSearchParams({ public_id: publicId, api_key: CFG.CLOUDINARY_KEY, timestamp, signature }).toString();
+    new URLSearchParams({ public_id: publicId, type: 'authenticated', timestamp, api_key: CFG.CLOUDINARY_KEY, signature }).toString();
 }
 
 /**
