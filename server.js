@@ -170,6 +170,8 @@ const JobSchema = new mongoose.Schema({
   closingDate: String,
   seoKeywords: String,
   seoDesc: String,
+  isCorporate: Boolean,
+  workplace: String,
   date: { type: Date, default: Date.now }
 }, { timestamps: true });
 
@@ -201,7 +203,8 @@ const AppSchema = new mongoose.Schema({
   availability: String,
   notes: String,
   adminNotes: String,
-  cvUrl: String,
+  cvUrl: String, // legacy — plain public URL, kept for records uploaded before private storage was added
+  cvPublicId: String, // Cloudinary public_id for a 'type=authenticated' (private) asset — use this for new uploads
   cvBase64: String, // though we prefer Cloudinary
   status: { type: String, default: 'new' },
   matchScore: Number,
@@ -245,7 +248,8 @@ const AppSchema = new mongoose.Schema({
   uploadedDocs: [{
     docType: String,
     fileName: String,
-    fileUrl: String,
+    fileUrl: String, // legacy — plain public URL, kept for records uploaded before private storage was added
+    filePublicId: String, // Cloudinary public_id for a 'type=authenticated' (private) asset — use this for new uploads
     uploadedAt: { type: Date, default: Date.now }
   }],
   date: { type: Date, default: Date.now }
@@ -580,7 +584,7 @@ const emailTpl = {
   },
 
   /* Admin alert when a candidate applies */
-  newApplicationAlert({ first_name, last_name, email, phone, sector, job_title, cvUrl }, cvBase64, cvFileName) {
+  newApplicationAlert({ first_name, last_name, email, phone, sector, job_title, cvUrl, cvPublicId }, cvBase64, cvFileName) {
     const emailData = {
       to     : CFG.EMAIL_NOTIFY,
       subject: `[Covenant Crest] New application — ${first_name} ${last_name} (${sector || 'general'})`,
@@ -596,7 +600,7 @@ const emailTpl = {
               <tr><td style="padding:8px 0;color:#666;font-size:13px;">Phone</td><td style="padding:8px 0;font-size:13px;">${htmlEsc(phone) || 'Not provided'}</td></tr>
               <tr><td style="padding:8px 0;color:#666;font-size:13px;">Sector</td><td style="padding:8px 0;font-size:13px;">${htmlEsc(sector) || '—'}</td></tr>
               <tr><td style="padding:8px 0;color:#666;font-size:13px;">Job</td><td style="padding:8px 0;font-size:13px;">${htmlEsc(job_title) || '—'}</td></tr>
-              ${cvUrl ? `<tr><td style="padding:8px 0;color:#666;font-size:13px;">Cloud Link</td><td style="padding:8px 0;font-size:13px;"><a href="${cvUrl}" target="_blank" style="color:#C9A84C;">View Online CV</a></td></tr>` : ''}
+              ${cvPublicId ? `<tr><td style="padding:8px 0;color:#666;font-size:13px;">CV</td><td style="padding:8px 0;font-size:13px;"><a href="https://www.covenantcrest.co.uk/admin.html#applications" target="_blank" style="color:#C9A84C;">View securely in Admin Panel</a> (candidate documents are private — log in to view)</td></tr>` : cvUrl ? `<tr><td style="padding:8px 0;color:#666;font-size:13px;">Cloud Link</td><td style="padding:8px 0;font-size:13px;"><a href="${cvUrl}" target="_blank" style="color:#C9A84C;">View Online CV</a></td></tr>` : ''}
             </table>
             <hr style="margin:16px 0;border:none;border-top:1px solid #eee;">
             <p style="font-size:11px;color:#999;margin:0;">Received: ${new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' })}</p>
@@ -650,13 +654,16 @@ const emailTpl = {
 // Uses Cloudinary's unsigned preset via HTTPS (no SDK needed)
 // Accepts base64 data from client or a file buffer
 // ─────────────────────────────────────────────
-function cloudinaryUpload(base64Data, folder = 'covenantcrest', publicId = null, resourceType = 'auto') {
+function cloudinaryUpload(base64Data, folder = 'covenantcrest', publicId = null, resourceType = 'auto', accessType = 'upload') {
   if (!CFG.CLOUDINARY_CLOUD || !CFG.CLOUDINARY_KEY || !CFG.CLOUDINARY_SECRET) {
     return Promise.reject(new Error('Cloudinary credentials not configured.'));
   }
   const timestamp = Math.floor(Date.now() / 1000);
   const params    = { timestamp, folder };
   if (publicId) params.public_id = publicId;
+  // 'authenticated' = private asset; requires a freshly-signed download URL to access (see cloudinarySignedDownloadUrl).
+  // Used for candidate CVs and compliance documents so they're never reachable via a bare, permanent link.
+  if (accessType === 'authenticated') params.type = 'authenticated';
 
   // Build signature
   const sigStr = Object.keys(params).sort()
@@ -693,6 +700,7 @@ function cloudinaryUpload(base64Data, folder = 'covenantcrest', publicId = null,
   addField('folder',    folder);
   addField('signature', signature);
   if (publicId) addField('public_id', publicId);
+  if (accessType === 'authenticated') addField('type', 'authenticated');
 
   const bodyStr = parts.join('\r\n') + `\r\n--${boundary}--\r\n`;
   const bodyBuf = Buffer.from(bodyStr, 'utf8');
@@ -851,6 +859,53 @@ function cloudinaryDelete(imageUrl) {
 }
 
 // ─────────────────────────────────────────────
+// CLOUDINARY SIGNED DOWNLOAD LINK
+// For 'type=authenticated' assets (candidate CVs / compliance docs), the
+// stored secure_url is not directly accessible. This mints a fresh,
+// signature-backed download link on demand — only ever called from routes
+// that have already checked the requester is authorised (admin session or
+// a valid candidate portal token). Nothing accessible via this link is
+// ever persisted in the database or emailed as a plain, reusable URL.
+// ─────────────────────────────────────────────
+function cloudinarySignedDownloadUrl(publicId, resourceType = 'raw') {
+  if (!publicId || !CFG.CLOUDINARY_CLOUD || !CFG.CLOUDINARY_KEY || !CFG.CLOUDINARY_SECRET) return null;
+  const timestamp = Math.floor(Date.now() / 1000);
+  const sigStr    = `public_id=${publicId}&timestamp=${timestamp}` + CFG.CLOUDINARY_SECRET;
+  const signature = crypto.createHash('sha1').update(sigStr).digest('hex');
+  return `https://api.cloudinary.com/v1_1/${CFG.CLOUDINARY_CLOUD}/${resourceType}/download?` +
+    new URLSearchParams({ public_id: publicId, api_key: CFG.CLOUDINARY_KEY, timestamp, signature }).toString();
+}
+
+/**
+ * Resolves a fresh, working link for one document on an application — either
+ * the CV (which='cv') or an uploaded compliance doc (docIndex=N).
+ * Prefers the private, signed link (cvPublicId / filePublicId); falls back
+ * to the legacy plain URL only for records uploaded before this existed.
+ * Returns: a URL string, or null if the document isn't found / doesn't exist.
+ * Returns undefined only if the query itself didn't specify which document.
+ */
+function resolveApplicationDocumentLink(appDoc, query) {
+  let publicId = null, legacyUrl = null;
+  if (query.which === 'cv') {
+    publicId = appDoc.cvPublicId;
+    legacyUrl = appDoc.cvUrl;
+  } else if (query.docIndex !== undefined) {
+    const idx = parseInt(query.docIndex, 10);
+    const doc = Number.isInteger(idx) ? (appDoc.uploadedDocs || [])[idx] : null;
+    if (!doc) return null;
+    publicId = doc.filePublicId;
+    legacyUrl = doc.fileUrl;
+  } else {
+    return undefined;
+  }
+  if (publicId) {
+    const signed = cloudinarySignedDownloadUrl(publicId, 'raw');
+    if (signed) return signed;
+  }
+  return legacyUrl || null;
+}
+
+// ─────────────────────────────────────────────
 // SEED DEFAULT JOBS
 // ─────────────────────────────────────────────
 async function seedDefaultJobs() {
@@ -908,7 +963,10 @@ app.get('/api/health', (req, res) => res.json(healthPayload()));
  * Returns: { token, role, email }
  */
 app.post('/api/auth/login', rateLimit(15 * 60 * 1000, 5), async (req, res) => {
-  const { email = '', password = '', honeypot = '', otp = '' } = req.body;
+  let { email = '', password = '', honeypot = '', otp = '' } = req.body;
+  if (typeof email !== 'string' || typeof password !== 'string') {
+    return res.status(400).json({ error: 'Email and password are required.' });
+  }
   const emailLc = email.trim().toLowerCase();
 
   // Honeypot check for bots
@@ -1284,17 +1342,36 @@ app.post('/api/jobs', requireAuth, async (req, res) => {
 /** PUT /api/jobs/:id — update job */
 app.put('/api/jobs/:id', requireAuth, async (req, res) => {
   try {
-    const { imageBase64, ...rest } = req.body;
-    let updateData = { ...rest };
-    
+    const { title, pay, sector, type, location, desc, req: requirements, status, imageBase64, closingDate, seoKeywords, seoDesc, isCorporate, workplace } = req.body;
+    const updateData = {};
+    if (title       !== undefined) updateData.title       = sanitise(title, 120);
+    if (pay         !== undefined) updateData.pay         = sanitise(pay, 60);
+    if (sector      !== undefined) updateData.sector      = sanitise(sector, 30);
+    if (type        !== undefined) updateData.type        = sanitise(type, 30);
+    if (location     !== undefined) updateData.location   = sanitise(location, 100);
+    if (desc        !== undefined) updateData.desc        = sanitise(desc, 8000);
+    if (requirements !== undefined) updateData.req        = sanitise(requirements, 5000);
+    if (status !== undefined && ['active', 'inactive'].includes(status)) updateData.status = status;
+    if (closingDate !== undefined) updateData.closingDate = closingDate;
+    if (seoKeywords !== undefined) updateData.seoKeywords = seoKeywords;
+    if (seoDesc     !== undefined) updateData.seoDesc     = seoDesc;
+    if (isCorporate !== undefined) updateData.isCorporate = isCorporate === true || isCorporate === 'true';
+    if (workplace   !== undefined) updateData.workplace   = sanitise(workplace, 20);
+
+    let oldImageUrl = null;
     if (imageBase64) {
       try {
+        const existing = await Job.findOne({ id: req.params.id });
+        oldImageUrl = existing ? existing.imageUrl : null;
         const up = await cloudinaryUpload(imageBase64, 'covenantcrest/jobs', `job-${req.params.id}`);
         updateData.imageUrl = up.url;
       } catch (e) { console.error('Cloudinary update failed:', e.message); }
     }
 
     const job = await Job.findOneAndUpdate({ id: req.params.id }, updateData, { new: true });
+    if (oldImageUrl && updateData.imageUrl && oldImageUrl !== updateData.imageUrl) {
+      cloudinaryDelete(oldImageUrl).catch(() => {});
+    }
     if (!job) return res.status(404).json({ error: 'Job not found.' });
     res.json(job);
   } catch(e) { res.status(500).json({ error: 'Failed to update job' }); }
@@ -1499,6 +1576,26 @@ app.get('/api/applications/all', requireAuth, async (req, res) => {
   } catch(e) { res.status(500).json({ error: 'Failed to fetch applications' }); }
 });
 
+/**
+ * GET /api/applications/:id/document — Auth (staff). Returns a fresh, short-lived
+ * link for the candidate's CV or a specific uploaded compliance document.
+ * Query: ?which=cv  OR  ?docIndex=N
+ * A new signed link is minted on every call — nothing reusable is ever stored.
+ */
+app.get('/api/applications/:id/document', requireAuth, async (req, res) => {
+  try {
+    const appDoc = await Application.findOne({ id: req.params.id });
+    if (!appDoc) return res.status(404).json({ error: 'Application not found.' });
+
+    const url = resolveApplicationDocumentLink(appDoc, req.query);
+    if (url === undefined) return res.status(400).json({ error: 'Specify which=cv or docIndex=N.' });
+    if (url === null) return res.status(404).json({ error: 'No document on file.' });
+    res.json({ url });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to generate document link.' });
+  }
+});
+
 /** GET /api/applications — Super Admin alias */
 app.get('/api/applications', requireSuperAdmin, async (req, res) => {
   try {
@@ -1560,8 +1657,8 @@ app.post('/api/applications', rateLimit(15 * 60 * 1000, 5), async (req, res) => 
           const ext = cvFileName.split('.').pop();
           if (ext) publicId += `.${ext}`;
         }
-        const up = await cloudinaryUpload(cvBase64, 'covenantcrest/cvs', publicId, 'raw');
-        entry.cvUrl = up.url;
+        const up = await cloudinaryUpload(cvBase64, 'covenantcrest/cvs', publicId, 'raw', 'authenticated');
+        entry.cvPublicId = up.publicId;
       } catch (e) { console.error('CV upload failed:', e.message); }
     }
 
@@ -1735,8 +1832,8 @@ app.post('/api/applications/import-indeed', requireAuth, async (req, res) => {
       }
       if (c.cvBase64) {
         try {
-          const up = await cloudinaryUpload(c.cvBase64, 'covenantcrest/cvs', `cv-indeed-${appDoc.id}`, 'raw');
-          appDoc.cvUrl = up.url;
+          const up = await cloudinaryUpload(c.cvBase64, 'covenantcrest/cvs', `cv-indeed-${appDoc.id}`, 'raw', 'authenticated');
+          appDoc.cvPublicId = up.publicId;
         } catch (e) { console.error('Cloudinary upload error:', e.message); }
       }
       await appDoc.save();
@@ -1886,16 +1983,40 @@ app.get('/api/portal/candidate/:token', async (req, res) => {
       status: appDoc.status,
       requestedDocsList: appDoc.requestedDocsList || [],
       requestedDocs: appDoc.requestedDocs || '',
-      uploadedDocs: appDoc.uploadedDocs || [],
+      // Document contents are never sent here — only metadata. The portal page
+      // requests a fresh, short-lived link per document via GET .../document
+      // when the candidate actually clicks to view one.
+      uploadedDocs: (appDoc.uploadedDocs || []).map(function(d) {
+        return { docType: d.docType, fileName: d.fileName, uploadedAt: d.uploadedAt };
+      }),
       interviewDate: appDoc.interviewDate,
       interviewTime: appDoc.interviewTime,
       interviewType: appDoc.interviewType,
       interviewLocation: appDoc.interviewLocation,
       interviewStatus: appDoc.interviewStatus,
-      cvUrl: appDoc.cvUrl
+      hasCv: !!(appDoc.cvUrl || appDoc.cvPublicId)
     });
   } catch (e) {
     res.status(500).json({ error: 'Failed to load candidate portal.' });
+  }
+});
+
+/**
+ * GET /api/portal/candidate/:token/document — Public (token-scoped). Returns a
+ * fresh, short-lived link for the candidate's own CV or an uploaded document.
+ * Query: ?which=cv  OR  ?docIndex=N
+ */
+app.get('/api/portal/candidate/:token/document', rateLimit(15 * 60 * 1000, 30), async (req, res) => {
+  try {
+    const appDoc = await Application.findOne({ docToken: req.params.token });
+    if (!appDoc) return res.status(404).json({ error: 'Invalid or expired candidate portal link.' });
+
+    const url = resolveApplicationDocumentLink(appDoc, req.query);
+    if (url === undefined) return res.status(400).json({ error: 'Specify which=cv or docIndex=N.' });
+    if (url === null) return res.status(404).json({ error: 'Document not available.' });
+    res.json({ url });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to generate document link.' });
   }
 });
 
@@ -1909,12 +2030,12 @@ app.post('/api/portal/candidate/:token/upload', rateLimit(15 * 60 * 1000, 10), a
     if (!appDoc) return res.status(404).json({ error: 'Invalid or expired candidate portal link.' });
 
     let publicId = `doc-${docType}-${appDoc.id}-${Date.now()}`;
-    const up = await cloudinaryUpload(fileBase64, 'covenantcrest/candidate_docs', publicId, 'raw');
+    const up = await cloudinaryUpload(fileBase64, 'covenantcrest/candidate_docs', publicId, 'raw', 'authenticated');
 
     const newDoc = {
       docType: sanitise(String(docType), 50),
       fileName: sanitise(String(fileName), 100),
-      fileUrl: up.url,
+      filePublicId: up.publicId,
       uploadedAt: new Date()
     };
 
@@ -1925,7 +2046,12 @@ app.post('/api/portal/candidate/:token/upload', rateLimit(15 * 60 * 1000, 10), a
 
     await appDoc.save();
 
-    res.json({ success: true, uploadedDoc: newDoc, allDocs: appDoc.uploadedDocs });
+    // Response omits filePublicId/fileUrl — the portal re-fetches a fresh signed
+    // link per document on demand, same as the metadata-only GET above.
+    var safeDocs = appDoc.uploadedDocs.map(function(d) {
+      return { docType: d.docType, fileName: d.fileName, uploadedAt: d.uploadedAt };
+    });
+    res.json({ success: true, uploadedDoc: { docType: newDoc.docType, fileName: newDoc.fileName, uploadedAt: newDoc.uploadedAt }, allDocs: safeDocs });
   } catch (e) {
     console.error('Candidate portal upload error:', e.message);
     res.status(500).json({ error: 'Failed to upload document.' });
