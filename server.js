@@ -2323,13 +2323,16 @@ async function syncToHubSpot(data, type) {
   };
 
   if (type === 'contact') {
-    properties.description = `[Client Staffing/General Enquiry]\nType: ${data.type || 'General'}\nSource: ${data.source || 'Website'}\nCompany: ${data.company || 'Not provided'}\n\nMessage:\n${data.message || ''}`;
+    // HubSpot Contacts have no built-in 'description' property (that's a Company/Deal field) —
+    // every sync using it was silently rejected with a 400. 'message' is a real default Contact
+    // property ("for any message or comments a contact may want to leave on a form").
+    properties.message = `[Client Staffing/General Enquiry]\nType: ${data.type || 'General'}\nSource: ${data.source || 'Website'}\nCompany: ${data.company || 'Not provided'}\n\nMessage:\n${data.message || ''}`;
     if (data.company) {
       properties.company = data.company;
     }
   } else if (type === 'candidate') {
     properties.jobtitle = data.job_title || 'Applicant';
-    properties.description = `[Candidate Application Portal]\nSector: ${data.sector || 'General'}\nAvailability: ${data.availability || 'Not provided'}\nCV Cloudinary Link: ${data.cvUrl || 'None'}\n\nCompliance & Vetting Vitals:\nDBS Certificate: ${data.dbs_cert_number || 'N/A'}\nSIA License: ${data.sia_licence_number || 'N/A'}\nFood Hygiene Expiry/Level: ${data.food_hygiene_level || 'N/A'}\nHGV/CPC License details: ${data.hgv_license || 'N/A'}\n\nCandidate Personal Statement/Notes:\n${data.notes || ''}`;
+    properties.message = `[Candidate Application Portal]\nSector: ${data.sector || 'General'}\nAvailability: ${data.availability || 'Not provided'}\nCV: ${data.cvUrl || (data.cvPublicId ? 'On file — view in Admin Panel' : 'None')}\n\nCompliance & Vetting Vitals:\nDBS Certificate: ${data.dbs_cert_number || 'N/A'}\nSIA License: ${data.sia_licence_number || 'N/A'}\nFood Hygiene Expiry/Level: ${data.food_hygiene_level || 'N/A'}\nHGV/CPC License details: ${data.hgv_license || 'N/A'}\n\nCandidate Personal Statement/Notes:\n${data.notes || ''}`;
   }
 
   const body = JSON.stringify({ properties });
