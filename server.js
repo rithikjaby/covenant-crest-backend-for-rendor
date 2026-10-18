@@ -549,7 +549,7 @@ const emailTpl = {
           </div>
           <div style="background:#fff;padding:24px;border-radius:0 0 6px 6px;border:1px solid #e0e0e0;">
             <p style="font-size:14px;line-height:1.7;color:#333;">We have received your <strong>${typeLabel}</strong> enquiry and a member of our team will be in touch shortly.</p>
-            <p style="font-size:14px;line-height:1.7;color:#333;">If your matter is urgent, please call us directly on <a href="tel:07346809846" style="color:#C9A84C;font-weight:600;">07346 809846</a>.</p>
+            <p style="font-size:14px;line-height:1.7;color:#333;">If your matter is urgent, please call us directly on <a href="tel:03334440156" style="color:#C9A84C;font-weight:600;">0333 444 0156</a>.</p>
             <hr style="margin:20px 0;border:none;border-top:1px solid #eee;">
             <p style="font-size:12px;color:#888;">Covenant Crest Group Ltd · Company No. 16528951 · Telford, Shropshire</p>
           </div>
@@ -573,7 +573,7 @@ const emailTpl = {
             <p style="font-size:14px;line-height:1.7;color:#333;">Thank you for applying for a <strong>${htmlEsc(sectorLabel)}</strong> role${job_title ? ' (<em>' + htmlEsc(job_title) + '</em>)' : ''} with Covenant Crest Group Ltd.</p>
             <p style="font-size:14px;line-height:1.7;color:#333;">We have received your application and our recruitment team will review it shortly. If your profile matches our current requirements, a consultant will be in touch within <strong>24–48 hours</strong>.</p>
             <div style="background:#f0f7f0;border-left:3px solid #C9A84C;padding:14px 18px;margin:20px 0;border-radius:0 6px 6px 0;">
-              <p style="font-size:13px;color:#333;margin:0;">If your matter is urgent, please call us directly on <a href="tel:07346809846" style="color:#C9A84C;font-weight:600;">07346 809846</a> or email <a href="mailto:recruitment@covenantcrest.co.uk" style="color:#C9A84C;">recruitment@covenantcrest.co.uk</a>.</p>
+              <p style="font-size:13px;color:#333;margin:0;">If your matter is urgent, please call us directly on <a href="tel:03334440156" style="color:#C9A84C;font-weight:600;">0333 444 0156</a> or email <a href="mailto:recruitment@covenantcrest.co.uk" style="color:#C9A84C;">recruitment@covenantcrest.co.uk</a>.</p>
             </div>
             <hr style="margin:20px 0;border:none;border-top:1px solid #eee;">
             <p style="font-size:12px;color:#888;margin:0;">Covenant Crest Group Ltd &middot; Company No. 16528951 &middot; Telford, Shropshire</p>
@@ -744,9 +744,17 @@ setInterval(() => {
   }
 }, 10 * 60 * 1000).unref();
 
-function rateLimit(windowMs, max) {
+// Behind Cloudflare -> Netlify -> Render, req.ip is a shared/rotating edge address, so an
+// IP-keyed limiter both let attackers through and could lock out unrelated visitors.
+// The first X-Forwarded-For entry is the visitor's own address.
+function clientIp(req) {
+  const first = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  return require('net').isIP(first) ? first : req.ip;
+}
+
+function rateLimit(windowMs, max, keyFn) {
   return (req, res, next) => {
-    const key = req.ip + ':' + req.path;
+    const key = (keyFn ? keyFn(req) : clientIp(req)) + ':' + req.path;
     const now = Date.now();
     const entry = rateLimitStore.get(key) || { count: 0, resetAt: now + windowMs };
 
@@ -791,6 +799,7 @@ app.use(cors({
     cb(null, false);
   },
   credentials: true,
+  exposedHeaders: ['Content-Disposition'],
 }));
 
 app.use(express.json({
@@ -946,18 +955,22 @@ app.get('/', (req, res) => res.json({
 }));
 
 function healthPayload() {
+  // Public endpoint: report liveness only, never which integrations are configured.
   return {
     status: 'healthy',
-    uptime: Math.floor(process.uptime()),
     db: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
-    databaseConnected:       mongoose.connection.readyState === 1,
-    hubspotConfigured:       !!CFG.HUBSPOT_ACCESS_TOKEN,
-    resendConfigured:        !!CFG.RESEND_API_KEY,
-    microsoftSSOConfigured:  !!(CFG.MICROSOFT_CLIENT_ID && CFG.MICROSOFT_CLIENT_SECRET),
   };
 }
 app.get('/health',     (req, res) => res.json(healthPayload()));
 app.get('/api/health', (req, res) => res.json(healthPayload()));
+// Full integration status for the admin panel only.
+app.get('/api/health/details', requireAuth, (req, res) => res.json({
+  status: 'healthy',
+  databaseConnected:      mongoose.connection.readyState === 1,
+  hubspotConfigured:      !!CFG.HUBSPOT_ACCESS_TOKEN,
+  resendConfigured:       !!CFG.RESEND_API_KEY,
+  microsoftSSOConfigured: !!(CFG.MICROSOFT_CLIENT_ID && CFG.MICROSOFT_CLIENT_SECRET),
+}));
 
 // ─────────────────────────────────────────────
 // ROUTES — AUTH
@@ -968,7 +981,9 @@ app.get('/api/health', (req, res) => res.json(healthPayload()));
  * Body: { email, password }
  * Returns: { token, role, email }
  */
-app.post('/api/auth/login', rateLimit(15 * 60 * 1000, 5), async (req, res) => {
+// Throttle per account as well as per address, so rotating IPs can't be used to guess a password.
+const loginKey = req => 'login:' + String((req.body && req.body.email) || '').toLowerCase().trim().slice(0, 120);
+app.post('/api/auth/login', rateLimit(15 * 60 * 1000, 5, loginKey), async (req, res) => {
   let { email = '', password = '', honeypot = '', otp = '' } = req.body;
   if (typeof email !== 'string' || typeof password !== 'string') {
     return res.status(400).json({ error: 'Email and password are required.' });
@@ -1596,7 +1611,37 @@ app.get('/api/applications/:id/document', requireAuth, async (req, res) => {
     const url = resolveApplicationDocumentLink(appDoc, req.query);
     if (url === undefined) return res.status(400).json({ error: 'Specify which=cv or docIndex=N.' });
     if (url === null) return res.status(404).json({ error: 'No document on file.' });
-    res.json({ url });
+    if (req.query.download !== '1') return res.json({ url });
+
+    // Stream the file ourselves so the download is named after the candidate
+    // (Cloudinary's own download link would name it after the internal code).
+    const idx = parseInt(req.query.docIndex, 10);
+    const srcId = req.query.which === 'cv' ? (appDoc.cvPublicId || appDoc.cvUrl || '')
+      : (((appDoc.uploadedDocs || [])[idx] || {}).filePublicId || ((appDoc.uploadedDocs || [])[idx] || {}).fileUrl || '');
+    const extMatch = String(srcId).split('?')[0].match(/\.([a-z0-9]{2,5})$/i);
+    const base = [appDoc.first_name, appDoc.last_name].filter(Boolean).join('_').replace(/[^A-Za-z0-9_-]/g, '') || 'Candidate';
+    const label = req.query.which === 'cv' ? 'CV' : 'Document';
+
+    const fetchStream = (target, hops) => https.get(target, (up) => {
+      if (up.statusCode >= 300 && up.statusCode < 400 && up.headers.location && hops < 3) {
+        up.resume();
+        return fetchStream(up.headers.location, hops + 1);
+      }
+      if (up.statusCode !== 200) {
+        up.resume();
+        return res.status(502).json({ error: 'Could not retrieve the document.' });
+      }
+      const type = up.headers['content-type'] || 'application/octet-stream';
+      const ext = extMatch ? extMatch[1].toLowerCase()
+        : type.includes('pdf') ? 'pdf'
+        : type.includes('wordprocessingml') ? 'docx'
+        : type.includes('msword') ? 'doc' : 'pdf';
+      res.setHeader('Content-Type', type);
+      res.setHeader('Content-Disposition', `attachment; filename="${base}_${label}.${ext}"`);
+      res.setHeader('Cache-Control', 'no-store');
+      up.pipe(res);
+    }).on('error', () => { if (!res.headersSent) res.status(502).json({ error: 'Could not retrieve the document.' }); });
+    fetchStream(url, 0);
   } catch (e) {
     res.status(500).json({ error: 'Failed to generate document link.' });
   }
@@ -2585,7 +2630,7 @@ app.post('/api/interviews/schedule-teams', requireAuth, async (req, res) => {
             <a href="${mockTeamsLink}" style="display:inline-block;background:#0078D4;color:#fff;padding:12px 24px;border-radius:4px;font-weight:600;text-decoration:none;font-size:13px;text-align:center;box-shadow:0 3px 8px rgba(0,120,212,0.25);" target="_blank" rel="noopener">Join Microsoft Teams Meeting</a>
           </div>
           
-          <p style="font-size:13px;line-height:1.75;color:#7A8694;">Please ensure you have a stable internet connection, working camera, and microphone. If you have any scheduling conflicts, please reply directly to this email or call <strong>07346 809846</strong> as soon as possible.</p>
+          <p style="font-size:13px;line-height:1.75;color:#7A8694;">Please ensure you have a stable internet connection, working camera, and microphone. If you have any scheduling conflicts, please reply directly to this email or call <strong>0333 444 0156</strong> as soon as possible.</p>
           
           <div style="border-top:1px solid #E8E4DC;margin-top:28px;padding-top:16px;text-align:center;font-size:11px;color:#9AA5B4;">
             Covenant Crest Group Ltd &bull; Registered in England & Wales Co. No. 16528951 &bull; Built on Promise.
@@ -2707,7 +2752,7 @@ app.post('/api/interviews/schedule-teams', requireAuth, async (req, res) => {
                 <a href="${teamsLink}" style="display:inline-block;background:#0078D4;color:#fff;padding:12px 24px;border-radius:4px;font-weight:600;text-decoration:none;font-size:13px;text-align:center;box-shadow:0 3px 8px rgba(0,120,212,0.25);" target="_blank" rel="noopener">Join Microsoft Teams Meeting</a>
               </div>
               
-              <p style="font-size:13px;line-height:1.75;color:#7A8694;">Please ensure you have a stable internet connection, working camera, and microphone. If you have any scheduling conflicts, please reply directly to this email or call <strong>07346 809846</strong> as soon as possible.</p>
+              <p style="font-size:13px;line-height:1.75;color:#7A8694;">Please ensure you have a stable internet connection, working camera, and microphone. If you have any scheduling conflicts, please reply directly to this email or call <strong>0333 444 0156</strong> as soon as possible.</p>
               
               <div style="border-top:1px solid #E8E4DC;margin-top:28px;padding-top:16px;text-align:center;font-size:11px;color:#9AA5B4;">
                 Covenant Crest Group Ltd &bull; Registered in England & Wales Co. No. 16528951 &bull; Built on Promise.
