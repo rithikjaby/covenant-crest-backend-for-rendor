@@ -1252,6 +1252,44 @@ app.get('/api/auth/microsoft-callback', async (req, res) => {
 // ROUTES — JOBS
 // ─────────────────────────────────────────────
 
+// ─────────────────────────────────────────────
+// ROUTES — FREIGHT GUIDE PRICE (middleman pricing; the margin never leaves the server)
+// ─────────────────────────────────────────────
+// Rates come from the FREIGHT_RATES_JSON environment variable on Render. Without it the estimator is switched off
+// and the website hides it, so no price is ever shown that has not been set deliberately. Example:
+// {"margin":0.2,
+//  "vehicles":{"van":{"rate":1.4,"per":1,"min":60},"7.5t":{"rate":2.0,"per":1,"min":120},
+//              "18t":{"rate":2.6,"per":1,"min":180},"artic":{"rate":3.0,"per":1,"min":250},
+//              "ltl":{"rate":12,"per":50,"min":55}},
+//  "services":{"standard":1,"express":1.4,"same":1.8,"temp":1.3}}
+// "rate" is what your haulier charges you; "per" is the distance step in miles; "min" is the haulier's minimum charge;
+// "margin" is your mark-up (0.2 = 20%). The numbers above are placeholders, not real rates.
+function loadFreightRates() {
+  try {
+    const r = JSON.parse(process.env.FREIGHT_RATES_JSON || 'null');
+    if (!r || typeof r !== 'object' || typeof r.margin !== 'number' || !r.vehicles || typeof r.vehicles !== 'object') return null;
+    return r;
+  } catch { return null; }
+}
+
+app.get('/api/freight-estimate/status', (req, res) => res.json({ enabled: !!loadFreightRates() }));
+
+app.post('/api/freight-estimate', rateLimit(15 * 60 * 1000, 60), (req, res) => {
+  const rates = loadFreightRates();
+  if (!rates) return res.status(503).json({ error: 'Guide prices are not available at the moment.' });
+  const b = req.body || {};
+  const v = Object.prototype.hasOwnProperty.call(rates.vehicles, b.vehicle) ? rates.vehicles[b.vehicle] : null;
+  const services = rates.services || { standard: 1 };
+  const service = b.service || 'standard';
+  const mult = Object.prototype.hasOwnProperty.call(services, service) ? services[service] : undefined;
+  const miles = Number(b.miles);
+  if (!v || mult === undefined || !(miles > 0 && miles <= 1500) || !(v.rate > 0)) return res.status(400).json({ error: 'Please check the details and try again.' });
+  const units = v.per > 1 ? Math.ceil(miles / v.per) : miles;
+  const cost = Math.max(v.rate * units, v.min || 0) * mult;
+  const price = Math.max(5, Math.round((cost * (1 + rates.margin)) / 5) * 5);
+  res.json({ total: price });
+});
+
 /** GET /api/jobs  — public, active jobs only */
 app.get('/api/jobs', async (req, res) => {
   try {
