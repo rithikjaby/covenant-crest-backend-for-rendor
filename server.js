@@ -548,7 +548,7 @@ const emailTpl = {
             <h2 style="color:#C9A84C;margin:0;font-size:20px;">Thank You, ${htmlEsc(name)}</h2>
           </div>
           <div style="background:#fff;padding:24px;border-radius:0 0 6px 6px;border:1px solid #e0e0e0;">
-            <p style="font-size:14px;line-height:1.7;color:#333;">We have received your <strong>${typeLabel}</strong> enquiry and a member of our team will be in touch shortly.</p>
+            <p style="font-size:14px;line-height:1.7;color:#333;">We have received your <strong>${typeLabel}</strong> enquiry and we will reply the same working day.</p>
             <p style="font-size:14px;line-height:1.7;color:#333;">If your matter is urgent, please call us directly on <a href="tel:03334440156" style="color:#C9A84C;font-weight:600;">0333 444 0156</a>.</p>
             <hr style="margin:20px 0;border:none;border-top:1px solid #eee;">
             <p style="font-size:12px;color:#888;">Covenant Crest Group Ltd · Company No. 16528951 · Telford, Shropshire</p>
@@ -571,7 +571,7 @@ const emailTpl = {
           <div style="background:#fff;padding:24px;border-radius:0 0 6px 6px;border:1px solid #e0e0e0;">
             <p style="font-size:14px;line-height:1.7;color:#333;">Dear <strong>${htmlEsc(first_name)} ${htmlEsc(last_name)}</strong>,</p>
             <p style="font-size:14px;line-height:1.7;color:#333;">Thank you for applying for a <strong>${htmlEsc(sectorLabel)}</strong> role${job_title ? ' (<em>' + htmlEsc(job_title) + '</em>)' : ''} with Covenant Crest Group Ltd.</p>
-            <p style="font-size:14px;line-height:1.7;color:#333;">We have received your application and our recruitment team will review it shortly. If your profile matches our current requirements, a consultant will be in touch within <strong>24–48 hours</strong>.</p>
+            <p style="font-size:14px;line-height:1.7;color:#333;">We have received your application and will review it. If your profile matches a current vacancy, we will be in touch.</p>
             <div style="background:#f0f7f0;border-left:3px solid #C9A84C;padding:14px 18px;margin:20px 0;border-radius:0 6px 6px 0;">
               <p style="font-size:13px;color:#333;margin:0;">If your matter is urgent, please call us directly on <a href="tel:03334440156" style="color:#C9A84C;font-weight:600;">0333 444 0156</a> or email <a href="mailto:recruitment@covenantcrest.co.uk" style="color:#C9A84C;">recruitment@covenantcrest.co.uk</a>.</p>
             </div>
@@ -923,25 +923,7 @@ function resolveApplicationDocumentLink(appDoc, query) {
 // ─────────────────────────────────────────────
 // SEED DEFAULT JOBS
 // ─────────────────────────────────────────────
-async function seedDefaultJobs() {
-  try {
-    const count = await Job.countDocuments();
-    if (count > 0) return;
-    const defaults = [
-      { id: uid(), title: 'Care Assistant',       sector: 'care',      type: 'full-time',  location: 'Telford',       pay: '£11.44–12.50/hr', desc: 'Compassionate care assistant needed in Telford to support elderly residents with daily living, personal care and companionship.', req: 'Enhanced DBS required. Experience preferred but not essential. Full training provided.', status: 'active' },
-      { id: uid(), title: 'Night Care Worker',     sector: 'care',      type: 'full-time',  location: 'Telford',       pay: '£12.00–13.50/hr', desc: 'Night shift care worker for a residential care home in Telford. Overnight personal care, medication and safety monitoring.',         req: 'Enhanced DBS. Night working experience preferred.',                                   status: 'active' },
-      { id: uid(), title: 'SIA Door Supervisor',   sector: 'security',  type: 'full-time',  location: 'Birmingham',    pay: '£13.00–15.00/hr', desc: 'Licensed Door Supervisor for various Birmingham city centre venues. Day and night shifts available.',                               req: 'Valid SIA Door Supervisor licence mandatory. Minimum 1 year experience.',              status: 'active' },
-      { id: uid(), title: 'Retail Security Officer',sector: 'security', type: 'part-time',  location: 'Wolverhampton', pay: '£11.44–12.50/hr', desc: 'Retail security officer for a busy retail park in Wolverhampton. Loss prevention and customer service.',                           req: 'SIA licence preferred.',                                                              status: 'active' },
-      { id: uid(), title: 'Warehouse Operative',   sector: 'warehouse', type: 'temporary',  location: 'Telford',       pay: '£11.44/hr',       desc: 'Warehouse operatives required immediately for a busy distribution centre. Picking, packing, goods-in and despatch.',              req: 'No experience necessary. Steel-toed boots required.',                                 status: 'active' },
-      { id: uid(), title: 'FLT Driver',            sector: 'warehouse', type: 'permanent',  location: 'Shrewsbury',    pay: '£13.00–14.50/hr', desc: 'Experienced forklift truck driver required for a manufacturing site in Shrewsbury.',                                               req: 'Valid FLT licence (counter-balance essential). 2+ years experience.',                 status: 'active' },
-    ];
-    await Job.insertMany(defaults);
-    console.log('✅ Seeded', defaults.length, 'default jobs to MongoDB');
-  } catch(e) { console.error('Seeding failed:', e.message); }
-}
-if (CFG.MONGODB_URI) {
-  seedDefaultJobs();
-}
+// Demo jobs used to be inserted here whenever the jobs collection was empty. Removed: every listing must be a real vacancy.
 console.log('[BOOT] Cloudinary — cloud:', CFG.CLOUDINARY_CLOUD, '| key length:', CFG.CLOUDINARY_KEY.length, '| secret configured:', CFG.CLOUDINARY_SECRET.length > 0);
 
 // ─────────────────────────────────────────────
@@ -1292,7 +1274,15 @@ app.get('/api/jobs/all', requireAuth, async (req, res) => {
   } catch(e) { res.status(500).json({ error: 'Failed to fetch jobs' }); }
 });
 
-/** GET /api/jobs/:id — single public job by ID */
+// True when the request carries a valid staff session (cookie or bearer token).
+function isStaffRequest(req) {
+  const cookies = parseCookies(req);
+  const cookieToken = cookies.cc_session ? decodeURIComponent(cookies.cc_session) : null;
+  const bearer = (req.headers['authorization'] || '').startsWith('Bearer ') ? req.headers['authorization'].slice(7) : null;
+  return !!(verifyToken(cookieToken) || verifyToken(bearer));
+}
+
+/** GET /api/jobs/:id — single public job by ID (unpublished jobs are visible to staff only) */
 app.get('/api/jobs/:id', async (req, res) => {
   try {
     const id = req.params.id;
@@ -1300,7 +1290,7 @@ app.get('/api/jobs/:id', async (req, res) => {
     if (!job && mongoose.Types.ObjectId.isValid(id)) {
       job = await Job.findById(id);
     }
-    if (!job) return res.status(404).json({ error: 'Job not found.' });
+    if (!job || (job.status !== 'active' && !isStaffRequest(req))) return res.status(404).json({ error: 'Job not found.' });
     res.json(job);
   } catch(e) {
     console.error('Fetch job error:', e.message);
@@ -1772,8 +1762,8 @@ app.put('/api/applications/:id', requireAuth, async (req, res) => {
           </div>
           <h3 style="color:#0D1B2A;font-size:18px;">Dear ${candidateName},</h3>
           <p style="font-size:14px;line-height:1.75;color:#4A5568;">Thank you for your interest in the <strong>${jobTitle}</strong> position with Covenant Crest Group and for taking the time to apply.</p>
-          <p style="font-size:14px;line-height:1.75;color:#4A5568;">${savedApp.rejectionReason || 'We received a large number of applications from highly qualified candidates. After careful review of your CV and background details, we regret to inform you that we will not be moving forward with your application for this position.'}</p>
-          <p style="font-size:14px;line-height:1.75;color:#4A5568;">We appreciate the time you invested in applying to Covenant Crest. We will retain your registration details in our talent pool database and will reach out to you if another opportunity arises that aligns with your skills and experience.</p>
+          <p style="font-size:14px;line-height:1.75;color:#4A5568;">${savedApp.rejectionReason || 'After reviewing your application, we will not be moving forward with it for this position.'}</p>
+          <p style="font-size:14px;line-height:1.75;color:#4A5568;">We appreciate the time you invested in applying to Covenant Crest. If another suitable opportunity arises we may be in touch. You can ask us to delete your details at any time by emailing info@covenantcrest.co.uk.</p>
           <p style="font-size:14px;line-height:1.75;color:#4A5568;">We wish you the very best in your job search and future career endeavors.</p>
           <br>
           <p style="font-size:14px;font-weight:600;color:#0D1B2A;margin:0;">Kind regards,</p>
